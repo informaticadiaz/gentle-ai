@@ -52,7 +52,7 @@ Las páginas están ordenadas de menor a mayor profundidad. Si seguís el orden,
    Instalar en macOS, Linux y Windows. Verificar que quedó bien. Qué hacer si algo falla. Cómo desinstalar.
 
 5. **[Tu primera configuración](05-primera-configuracion.md)**
-   Recorrido por la TUI: elegir agente(s), elegir preset (`minimal` / `recommended` / `everything`), elegir componentes. Qué se instala en cada caso.
+   Recorrido por la TUI: elegir agente(s), elegir preset (`minimal` / `ecosystem-only` / `full-gentleman` / `custom`), elegir componentes. Qué se instala en cada caso.
 
 6. **[Tu primera sesión real](06-primera-sesion.md)**
    Abrir el agente en un proyecto, correr `/sdd-init`, hacer una tarea chica y otra más grande para ver la diferencia. Qué esperar y qué **no** esperar.

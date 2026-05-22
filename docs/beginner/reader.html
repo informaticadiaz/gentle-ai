@@ -483,12 +483,34 @@
     let currentLessonId = 1;
     let completedLessons = new Set(JSON.parse(localStorage.getItem("completedLessons") || "[]"));
 
+    // Lessons data embedded
+    const lessonsData = [
+      { id: 1, file: "01-que-es-gentle-ai.md", title: "¿Qué es Gentle-AI?", section: "Fundamentos" },
+      { id: 2, file: "02-glosario.md", title: "Glosario rápido", section: "Fundamentos" },
+      { id: 3, file: "03-agentes-soportados.md", title: "Agentes soportados", section: "Fundamentos" },
+      { id: 4, file: "04-instalacion.md", title: "Instalación paso a paso", section: "Primeros pasos" },
+      { id: 5, file: "05-primera-configuracion.md", title: "Tu primera configuración", section: "Primeros pasos" },
+      { id: 6, file: "06-primera-sesion.md", title: "Tu primera sesión real", section: "Primeros pasos" },
+      { id: 7, file: "07-engram-memoria.md", title: "Engram: memoria persistente", section: "Conceptos clave" },
+      { id: 8, file: "08-sdd-spec-driven.md", title: "SDD: Spec-Driven Development", section: "Conceptos clave" },
+      { id: 9, file: "09-skills.md", title: "Skills: capacidades curadas", section: "Conceptos clave" },
+      { id: 10, file: "10-subagentes-delegacion.md", title: "Sub-agentes y delegación", section: "Conceptos clave" },
+      { id: 11, file: "11-personas-permisos.md", title: "Personas y permisos", section: "Conceptos clave" },
+      { id: 12, file: "12-mcp.md", title: "MCP en 5 minutos", section: "Conceptos clave" },
+      { id: 13, file: "13-caso-proyecto-nuevo.md", title: "Caso: arrancar un proyecto nuevo", section: "Casos de uso" },
+      { id: 14, file: "14-caso-repo-existente.md", title: "Caso: sumarse a un repo existente", section: "Casos de uso" },
+      { id: 15, file: "15-caso-opencode-profiles.md", title: "Caso: OpenCode con múltiples modelos", section: "Casos de uso" },
+      { id: 16, file: "16-caso-engram-team.md", title: "Caso: compartir memoria con tu equipo", section: "Casos de uso" },
+      { id: 17, file: "17-update-backups.md", title: "Actualizar y respaldos", section: "Mantenimiento y resolución" },
+      { id: 18, file: "18-troubleshooting.md", title: "Resolución de problemas comunes", section: "Mantenimiento y resolución" },
+      { id: 19, file: "19-siguientes-pasos.md", title: "¿Qué leer ahora?", section: "Mantenimiento y resolución" },
+      { id: 20, file: "20-contribuir.md", title: "Cómo contribuir siendo principiante", section: "Contribuir" }
+    ];
+
     // Load lessons metadata
     async function loadLessons() {
       try {
-        const response = await fetch("lessons.json");
-        const data = await response.json();
-        lessons = data.lessons;
+        lessons = lessonsData;
         renderSidebar();
         loadLesson(1);
       } catch (error) {

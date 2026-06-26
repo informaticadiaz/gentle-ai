@@ -13,7 +13,6 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/system"
-	"github.com/gentleman-programming/gentle-ai/internal/versions"
 )
 
 const (
@@ -22,11 +21,32 @@ const (
 	piMCPAdapterDependency   = "pi-mcp-adapter"
 	piMCPAdapterVersion      = "2.6.0"
 	piMCPAdapterVersionRange = "^2.6.0"
+	piAppendSystemFile       = "APPEND_SYSTEM.md"
 	piEngramMCPConfigFile    = "mcp.json"
 	piSettingsFile           = "settings.json"
 	piNPMDirectory           = "npm"
 	piNPMPackageFile         = "package.json"
+	piSubagentsRepo          = "https://github.com/nicobailon/pi-subagents.git"
+	piSubagentsPath          = "$HOME/.pi/agent/vendor/pi-subagents"
 )
+
+func piSubagentsInstallCommand(profile system.PlatformProfile) []string {
+	if profile.OS == "windows" {
+		packagePath := `$env:USERPROFILE\.pi\agent\vendor\pi-subagents`
+		return []string{
+			"powershell",
+			"-NoProfile",
+			"-Command",
+			"$ErrorActionPreference = 'Stop'; $packageDir = \"" + packagePath + "\"; $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString()); $cloneDir = Join-Path $tmp 'pi-subagents'; New-Item -ItemType Directory -Path $tmp | Out-Null; try { git clone --depth 1 " + piSubagentsRepo + " $cloneDir; npm install --omit=dev --prefix $cloneDir; if (Test-Path $packageDir) { Remove-Item -Recurse -Force $packageDir }; New-Item -ItemType Directory -Force -Path (Split-Path $packageDir) | Out-Null; Copy-Item -Recurse $cloneDir $packageDir; pi install $packageDir } finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }",
+		}
+	}
+
+	return []string{
+		"sh",
+		"-c",
+		": \"${HOME:?HOME is required}\" && tmp=$(mktemp -d) && trap 'rm -rf \"$tmp\"' EXIT && git clone --depth 1 " + piSubagentsRepo + " \"$tmp/pi-subagents\" && npm install --omit=dev --prefix \"$tmp/pi-subagents\" && rm -rf \"" + piSubagentsPath + "\" && mkdir -p \"$(dirname \"" + piSubagentsPath + "\")\" && cp -R \"$tmp/pi-subagents\" \"" + piSubagentsPath + "\" && pi install \"" + piSubagentsPath + "\"",
+	}
+}
 
 type statResult struct {
 	isDir bool
@@ -52,7 +72,7 @@ func (a *Adapter) Agent() model.AgentID { return model.AgentPi }
 func (a *Adapter) Tier() model.SupportTier { return model.TierFull }
 
 func (a *Adapter) Detect(_ context.Context, homeDir string) (bool, string, string, bool, error) {
-	configPath := ConfigPath(homeDir)
+	configPath := AgentConfigPath(homeDir)
 	binaryPath, err := a.lookPath("pi")
 	installed := err == nil && binaryPath != ""
 
@@ -69,27 +89,35 @@ func (a *Adapter) Detect(_ context.Context, homeDir string) (bool, string, strin
 
 func (a *Adapter) SupportsAutoInstall() bool { return true }
 
-func (a *Adapter) InstallCommand(system.PlatformProfile) ([][]string, error) {
+func (a *Adapter) InstallCommand(profile system.PlatformProfile) ([][]string, error) {
 	return [][]string{
 		{"pi", "install", "npm:gentle-pi"},
 		{"pi", "install", "npm:gentle-engram"},
 		{"pi", "install", "npm:pi-mcp-adapter"},
-		{"npm", "exec", "--yes", "--package", "gentle-engram@" + versions.GentleEngram, "--", "pi-engram", "init"},
-		{"pi", "install", "npm:pi-subagents"},
+		a.engramInitCommand(),
+		piSubagentsInstallCommand(profile),
 		{"pi", "install", "npm:pi-intercom"},
 		{"pi", "install", "npm:@juicesharp/rpiv-ask-user-question"},
 		{"pi", "install", "npm:pi-web-access"},
-		{"pi", "install", "npm:pi-lens"},
 		{"pi", "install", "npm:@juicesharp/rpiv-todo"},
 		{"pi", "install", "npm:pi-btw"},
 	}, nil
 }
 
+func (a *Adapter) engramInitCommand() []string {
+	if _, err := a.lookPath("pnpm"); err == nil {
+		return []string{"pnpm", "dlx", "gentle-engram@latest", "pi-engram", "init"}
+	}
+	return []string{"npm", "exec", "--yes", "--package", "gentle-engram@latest", "--", "pi-engram", "init"}
+}
+
 func (a *Adapter) GlobalConfigDir(homeDir string) string { return ConfigPath(homeDir) }
 
-func (a *Adapter) SystemPromptDir(string) string { return "" }
+func (a *Adapter) SystemPromptDir(homeDir string) string { return AgentConfigPath(homeDir) }
 
-func (a *Adapter) SystemPromptFile(string) string { return "" }
+func (a *Adapter) SystemPromptFile(homeDir string) string {
+	return filepath.Join(AgentConfigPath(homeDir), piAppendSystemFile)
+}
 
 func (a *Adapter) SkillsDir(string) string { return "" }
 
@@ -123,7 +151,7 @@ func (a *Adapter) EmbeddedSubAgentsDir() string { return "" }
 
 func (a *Adapter) SupportsSkills() bool { return false }
 
-func (a *Adapter) SupportsSystemPrompt() bool { return false }
+func (a *Adapter) SupportsSystemPrompt() bool { return true }
 
 func (a *Adapter) SupportsMCP() bool { return true }
 

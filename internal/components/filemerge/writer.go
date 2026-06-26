@@ -13,6 +13,15 @@ import (
 
 // runtimeGOOS and syncDirFn are package-level vars so tests can override them
 // without spawning a real Windows process.
+//
+// Background: Windows/NTFS does not support fsyncing a directory file
+// descriptor. Calling (*os.File).Sync() on a directory handle returns
+// ERROR_ACCESS_DENIED (syscall 5) regardless of user privileges — even as
+// Administrator. FlushFileBuffers requires GENERIC_WRITE access on the handle,
+// which Windows refuses for directories. The ErrPermission from syncDirFn is
+// therefore silently tolerated when runtimeGOOS() == "windows". On Linux and
+// macOS the full error is propagated so unexpected failures are still surfaced.
+// See issues #293 and #294.
 var runtimeGOOS = func() string { return runtime.GOOS }
 var syncDirFn = func(dir string) error {
 	fd, err := os.Open(dir)
@@ -141,7 +150,17 @@ func ensureAtomicParentDir(dir, path string) error {
 		return fmt.Errorf("stat parent directory for %q: %w", path, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing symlink parent directory %q for %q", dir, path)
+		// Parent is a symlink (e.g. ~/.claude/agents → dotfiles repo).
+		// Resolve the target and continue checks against the real directory.
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			return fmt.Errorf("resolving symlink parent %q for %q: %w", dir, path, err)
+		}
+		info, err = os.Stat(resolved)
+		if err != nil {
+			return fmt.Errorf("stat symlink target %q for %q: %w", resolved, path, err)
+		}
+		dir = resolved
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("parent path %q for %q is not a directory", dir, path)

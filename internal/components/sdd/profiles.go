@@ -12,6 +12,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/assets"
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/internal/opencode"
 )
 
 // profileNameRegex matches valid profile name slugs: lowercase alphanumeric + hyphens,
@@ -19,10 +20,18 @@ import (
 var profileNameRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
 // reservedProfileNames are names that may not be used as profile names.
-var reservedProfileNames = map[string]bool{
-	"default":          true,
-	"sdd-orchestrator": true,
-}
+// JD agent names are derived from opencode.JDPhases() to avoid drift
+// when agents are renamed or added.
+var reservedProfileNames = func() map[string]bool {
+	names := map[string]bool{
+		"default":          true,
+		"sdd-orchestrator": true,
+	}
+	for _, name := range opencode.JDPhases() {
+		names[name] = true
+	}
+	return names
+}()
 
 // ValidateProfileName returns an error if the profile name is not a valid
 // slug (lowercase alphanumeric + hyphens, no underscores, no spaces, non-empty,
@@ -57,10 +66,26 @@ var profilePhaseOrder = []string{
 	"sdd-onboard",
 }
 
+var reviewAgentNames = []string{
+	"review-risk",
+	"review-readability",
+	"review-reliability",
+	"review-resilience",
+}
+
 // ProfilePhaseOrder returns the ordered list of SDD sub-agent phase names.
 // Use this instead of duplicating the slice in other packages.
 func ProfilePhaseOrder() []string {
 	return append([]string(nil), profilePhaseOrder...)
+}
+
+// ProfileAssignmentPhaseOrder returns the ordered list of agent names accepted
+// by profile phase assignments. This includes SDD phase agents plus the
+// Judgment Day agents that can be generated as profile-scoped overrides.
+func ProfileAssignmentPhaseOrder() []string {
+	phases := ProfilePhaseOrder()
+	phases = append(phases, opencode.JDPhases()...)
+	return phases
 }
 
 // ResolveProfileStrategy resolves the sync profile strategy with this order:
@@ -102,7 +127,7 @@ func HasExternalProfileFiles(homeDir string) bool {
 	return false
 }
 
-// ProfileAgentKeys returns the 11 agent keys for the given profile name.
+// ProfileAgentKeys returns the agent keys for the given profile name.
 // When name is empty, it returns the default (unsuffixed) keys.
 // When name is non-empty, each key is suffixed with "-{name}".
 func ProfileAgentKeys(name string) []string {
@@ -111,10 +136,15 @@ func ProfileAgentKeys(name string) []string {
 		suffix = "-" + name
 	}
 
-	keys := make([]string, 0, 11)
+	keys := make([]string, 0, 14)
 	keys = append(keys, "sdd-orchestrator"+suffix)
 	for _, phase := range profilePhaseOrder {
 		keys = append(keys, phase+suffix)
+	}
+	if name != "" {
+		for _, jd := range opencode.JDPhases() {
+			keys = append(keys, jd+suffix)
+		}
 	}
 	return keys
 }
@@ -176,7 +206,7 @@ func DetectProfiles(settingsPath string) ([]model.Profile, error) {
 
 		orchModel := extractModelFromAgent(orchMap)
 		phaseAssignments := make(map[string]model.ModelAssignment)
-		for _, phase := range profilePhaseOrder {
+		for _, phase := range ProfileAssignmentPhaseOrder() {
 			agentKey := phase + "-" + profileName
 			agentRaw := agentMap[agentKey]
 			agentMap2, _ := agentRaw.(map[string]any)
@@ -255,24 +285,42 @@ func GenerateProfileOverlay(profile model.Profile, homeDir string) ([]byte, erro
 	for _, phase := range profilePhaseOrder {
 		taskPerms[phase+suffix] = "allow"
 	}
+	// Add JD agent permissions. Profiles without JD assignments keep delegating to
+	// the global JD agents; profiles with JD assignments delegate to the generated
+	// suffixed JD agents instead.
+	for _, jd := range opencode.JDPhases() {
+		if hasProfileAssignment(profile, jd) {
+			taskPerms[jd+suffix] = "allow"
+		} else {
+			taskPerms[jd] = "allow"
+		}
+	}
+	// Add 4R review agent permissions (global, not profile-scoped).
+	// The base overlays define these shared review agents; named profiles only
+	// need permission to delegate to the unsuffixed global agent keys.
+	for _, reviewAgent := range reviewAgentNames {
+		taskPerms[reviewAgent] = "allow"
+	}
 
 	orchEntry := map[string]any{
 		"mode":        "primary",
 		"description": "SDD Orchestrator (" + profile.Name + " profile) - coordinates sub-agents, never does work inline",
 		"prompt":      orchestratorPrompt,
 		"permission": map[string]any{
+			"question": "allow",
 			"task": map[string]any{
 				"__replace__": taskPerms,
 			},
 		},
 		"tools": map[string]any{
-			"read":            true,
-			"write":           true,
-			"edit":            true,
-			"bash":            true,
-			"delegate":        true,
-			"delegation_read": true,
-			"delegation_list": true,
+			"__replace__": map[string]any{
+				"read":     true,
+				"write":    true,
+				"edit":     true,
+				"bash":     true,
+				"question": true,
+				"task":     true,
+			},
 		},
 	}
 	if profile.OrchestratorModel.ProviderID != "" && profile.OrchestratorModel.ModelID != "" {
@@ -304,11 +352,12 @@ func GenerateProfileOverlay(profile model.Profile, homeDir string) ([]byte, erro
 
 	for _, phase := range profilePhaseOrder {
 		key := phase + suffix
+		prompt := "{file:" + filepath.ToSlash(filepath.Join(promptDir, phase+".md")) + "}"
 		entry := map[string]any{
 			"mode":        "subagent",
 			"hidden":      true,
 			"description": phaseDescriptions[phase],
-			"prompt":      "{file:" + filepath.Join(promptDir, phase+".md") + "}",
+			"prompt":      prompt,
 			"tools": map[string]any{
 				"read":  true,
 				"write": true,
@@ -329,6 +378,22 @@ func GenerateProfileOverlay(profile model.Profile, homeDir string) ([]byte, erro
 		agentMap[key] = entry
 	}
 
+	for _, jd := range opencode.JDPhases() {
+		assignment, ok := profile.PhaseAssignments[jd]
+		if !ok || assignment.ProviderID == "" || assignment.ModelID == "" {
+			continue
+		}
+		key := jd + suffix
+		entry := jdProfileAgentEntry(jd)
+		entry["model"] = assignment.FullID()
+		if assignment.Effort != "" {
+			entry["variant"] = assignment.Effort
+		} else {
+			entry["variant"] = ""
+		}
+		agentMap[key] = entry
+	}
+
 	overlay := map[string]any{
 		"agent": agentMap,
 	}
@@ -340,14 +405,134 @@ func GenerateProfileOverlay(profile model.Profile, homeDir string) ([]byte, erro
 	return append(result, '\n'), nil
 }
 
+func hasProfileAssignment(profile model.Profile, phase string) bool {
+	assignment, ok := profile.PhaseAssignments[phase]
+	return ok && assignment.ProviderID != "" && assignment.ModelID != ""
+}
+
+func cleanupStaleProfileJDAgents(settingsPath string, profile model.Profile) (filemerge.WriteResult, error) {
+	if profile.Name == "" || profile.Name == "default" {
+		return filemerge.WriteResult{}, nil
+	}
+
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return filemerge.WriteResult{}, nil
+		}
+		return filemerge.WriteResult{}, fmt.Errorf("read settings %q: %w", settingsPath, err)
+	}
+
+	root, err := filemerge.UnmarshalJSONObject(data)
+	if err != nil {
+		// Keep this cleanup no stricter than mergeJSONFile/filemerge.MergeJSONObjects:
+		// malformed existing OpenCode configs are treated as an empty base during
+		// merge after the backup step, so stale-key cleanup must not block sync first.
+		return filemerge.WriteResult{}, nil
+	}
+
+	agentRaw, ok := root["agent"]
+	if !ok {
+		return filemerge.WriteResult{}, nil
+	}
+	agentMap, ok := agentRaw.(map[string]any)
+	if !ok {
+		return filemerge.WriteResult{}, nil
+	}
+
+	deleted := 0
+	suffix := "-" + profile.Name
+	for _, jd := range opencode.JDPhases() {
+		if hasProfileAssignment(profile, jd) {
+			continue
+		}
+		key := jd + suffix
+		if _, exists := agentMap[key]; exists {
+			delete(agentMap, key)
+			deleted++
+		}
+	}
+	if deleted == 0 {
+		return filemerge.WriteResult{}, nil
+	}
+
+	root["agent"] = agentMap
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return filemerge.WriteResult{}, fmt.Errorf("marshal settings: %w", err)
+	}
+	out = append(out, '\n')
+
+	return filemerge.WriteFileAtomic(settingsPath, out, 0o644)
+}
+
+func jdProfileAgentEntry(jd string) map[string]any {
+	switch jd {
+	case "jd-judge-a":
+		return map[string]any{
+			"mode":        "subagent",
+			"hidden":      true,
+			"description": "Adversarial code reviewer — blind judge A for judgment-day protocol",
+			"prompt":      "You are a judgment-day adversarial reviewer. Execute the review instructions provided in the task prompt exactly. Do NOT delegate further. Do NOT modify any code — your job is ONLY to find problems.",
+			"tools": map[string]any{
+				"read": true,
+				"bash": true,
+			},
+		}
+	case "jd-judge-b":
+		return map[string]any{
+			"mode":        "subagent",
+			"hidden":      true,
+			"description": "Adversarial code reviewer — blind judge B for judgment-day protocol",
+			"prompt":      "You are a judgment-day adversarial reviewer. Execute the review instructions provided in the task prompt exactly. Do NOT delegate further. Do NOT modify any code — your job is ONLY to find problems.",
+			"tools": map[string]any{
+				"read": true,
+				"bash": true,
+			},
+		}
+	case "jd-fix-agent":
+		return map[string]any{
+			"mode":        "subagent",
+			"hidden":      true,
+			"description": "Surgical fix agent for judgment-day protocol",
+			"prompt":      "You are a judgment-day surgical fix agent. Execute the fix instructions provided in the task prompt exactly. Do NOT delegate further. Fix ONLY the confirmed issues listed — do NOT refactor beyond what is strictly needed.",
+			"tools": map[string]any{
+				"read":  true,
+				"write": true,
+				"edit":  true,
+				"bash":  true,
+			},
+		}
+	default:
+		return map[string]any{
+			"mode":        "subagent",
+			"hidden":      true,
+			"description": jd,
+			"prompt":      "Execute the task prompt exactly. Do NOT delegate further.",
+			"tools": map[string]any{
+				"read": true,
+				"bash": true,
+			},
+		}
+	}
+}
+
 // buildProfileOrchestratorPrompt constructs the orchestrator prompt for a named
 // profile. It:
 //  1. Reads the base OpenCode-specific orchestrator asset
-//  2. Injects a model assignments table reflecting the profile's models
-//  3. Replaces bare sub-agent references (e.g. sdd-init) with suffixed ones
+//  2. Extracts the section matching the orchestrator's model capability (capable or small)
+//  3. Injects a model assignments table reflecting the profile's models
+//  4. Replaces bare sub-agent references (e.g. sdd-init) with suffixed ones
 //     (e.g. sdd-init-{name}) in the prompt text
 func buildProfileOrchestratorPrompt(profile model.Profile) (string, error) {
 	base := assets.MustRead(sddOrchestratorAsset(model.AgentOpenCode))
+
+	// Extract section based on model capability (derived from model name).
+	capability := "capable"
+	if profile.OrchestratorModel.ModelID != "" {
+		capability = model.ModelCapability(profile.OrchestratorModel.ModelID)
+	}
+	base = extractModelSection(base, capability)
 
 	// Inject model assignments table.
 	const openMarker = "<!-- gentle-ai:sdd-model-assignments -->"
@@ -360,7 +545,6 @@ func buildProfileOrchestratorPrompt(profile model.Profile) (string, error) {
 		afterOpen := start + len(openMarker)
 		base = base[:afterOpen] + "\n" + table + base[end:]
 	}
-
 	// Replace sub-agent references in the prompt text so the orchestrator
 	// delegates to the suffixed agents (e.g. sdd-init-cheap instead of sdd-init).
 	suffix := "-" + profile.Name
@@ -370,10 +554,55 @@ func buildProfileOrchestratorPrompt(profile model.Profile) (string, error) {
 		// Use a simple but safe approach: replace "sdd-{phase}" not already suffixed.
 		base = replacePhaseRef(base, phase, phase+suffix)
 	}
+	for _, jd := range opencode.JDPhases() {
+		if hasProfileAssignment(profile, jd) {
+			base = replacePhaseRef(base, jd, jd+suffix)
+		}
+	}
 	// Also replace the orchestrator self-reference.
 	base = replacePhaseRef(base, "sdd-orchestrator", "sdd-orchestrator"+suffix)
+	base = appendProfileJDDelegationOverrides(base, profile)
 
 	return base, nil
+}
+
+func appendProfileJDDelegationOverrides(content string, profile model.Profile) string {
+	var assigned []string
+	for _, jd := range opencode.JDPhases() {
+		if hasProfileAssignment(profile, jd) {
+			assigned = append(assigned, jd)
+		}
+	}
+	if len(assigned) == 0 {
+		return content
+	}
+
+	suffix := "-" + profile.Name
+	var b strings.Builder
+	b.WriteString(strings.TrimRight(content, "\n"))
+	b.WriteString("\n\n### Profile Judgment Day Delegation Overrides\n\n")
+	b.WriteString("This profile has model-specific Judgment Day assignments. When delegating those slots, use the profile-scoped agent names below instead of the global defaults:\n\n")
+	for _, jd := range assigned {
+		b.WriteString(fmt.Sprintf("- `%s` -> `%s%s`\n", jd, jd, suffix))
+	}
+	b.WriteString("\nIf a Judgment Day slot is not listed here, keep using its global/default agent name.\n")
+	return b.String()
+}
+
+// extractModelSection extracts the section matching the given capability
+// ("capable" or "small") from content containing <!-- section:model-capable -->
+// and <!-- section:model-small --> markers. If no matching section is found,
+// the full content is returned.
+func extractModelSection(content, capability string) string {
+	openMarker := "<!-- section:model-" + capability + " -->"
+	closeMarker := "<!-- /section:model-" + capability + " -->"
+	start := strings.Index(content, openMarker)
+	end := strings.Index(content, closeMarker)
+	if start == -1 || end == -1 || end <= start {
+		return content
+	}
+	afterOpen := start + len(openMarker)
+	return strings.TrimLeft(content[afterOpen:end], " \t\r\n")
 }
 
 // replacePhaseRef replaces occurrences of 'from' with 'to' in content.
@@ -453,13 +682,29 @@ func renderProfileModelAssignmentsSection(profile model.Profile) string {
 		reason := phaseReasons[phase]
 		b.WriteString(fmt.Sprintf("| %s | %s | %s |\n", phase, phaseModel, reason))
 	}
+	for _, jd := range opencode.JDPhases() {
+		phaseModel := "—"
+		if m, ok := profile.PhaseAssignments[jd]; ok && m.ProviderID != "" {
+			phaseModel = m.FullID()
+		}
+		if phaseModel == "—" {
+			continue
+		}
+		reason := map[string]string{
+			"jd-judge-a":   "Judgment Day blind judge A",
+			"jd-judge-b":   "Judgment Day blind judge B",
+			"jd-fix-agent": "Judgment Day confirmed blocker fixes",
+		}[jd]
+		b.WriteString(fmt.Sprintf("| %s | %s | %s |\n", jd, phaseModel, reason))
+	}
 	b.WriteString("\n")
 	return b.String()
 }
 
-// RemoveProfileAgents reads the opencode.json at settingsPath, removes all 11
-// agent keys belonging to the named profile (sdd-orchestrator-{name} and
-// sdd-{phase}-{name}), and atomically writes the result back.
+// RemoveProfileAgents reads the opencode.json at settingsPath, removes all agent
+// keys belonging to the named profile (sdd-orchestrator-{name},
+// sdd-{phase}-{name}, and profile-scoped Judgment Day agents), and atomically
+// writes the result back.
 //
 // Returns an error if name is empty or "default" (cannot remove the default profile).
 // If the profile's agent keys are not present, the operation is a no-op (no error).
@@ -476,8 +721,8 @@ func RemoveProfileAgents(settingsPath string, profileName string) error {
 		return fmt.Errorf("read settings %q: %w", settingsPath, err)
 	}
 
-	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	root, err := filemerge.UnmarshalJSONObject(data)
+	if err != nil {
 		return fmt.Errorf("parse settings %q: %w", settingsPath, err)
 	}
 
@@ -490,7 +735,7 @@ func RemoveProfileAgents(settingsPath string, profileName string) error {
 		return nil // No-op: malformed
 	}
 
-	// Delete the 11 profile keys, tracking how many were actually present.
+	// Delete the profile keys, tracking how many were actually present.
 	keysToDelete := ProfileAgentKeys(profileName)
 	deleted := 0
 	for _, key := range keysToDelete {

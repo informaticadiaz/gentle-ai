@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,9 +14,11 @@ import (
 	"time"
 
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
+	codexagent "github.com/gentleman-programming/gentle-ai/internal/agents/codex"
 	"github.com/gentleman-programming/gentle-ai/internal/agents/kimi"
 	"github.com/gentleman-programming/gentle-ai/internal/assets"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
+	"github.com/gentleman-programming/gentle-ai/internal/components/communitytool"
 	"github.com/gentleman-programming/gentle-ai/internal/components/engram"
 	"github.com/gentleman-programming/gentle-ai/internal/components/gga"
 	"github.com/gentleman-programming/gentle-ai/internal/components/mcp"
@@ -46,12 +49,20 @@ type InstallResult struct {
 }
 
 var (
-	osUserHomeDir       = os.UserHomeDir
-	osSetenv            = os.Setenv
-	osStat              = os.Stat
-	runCommand          = executeCommand
-	cmdLookPath         = exec.LookPath
-	streamCommandOutput = true
+	osUserHomeDir        = os.UserHomeDir
+	osSetenv             = os.Setenv
+	osStat               = os.Stat
+	runCommand           = executeCommand
+	cmdLookPath          = exec.LookPath
+	streamCommandOutput  = true
+	goEnv                = defaultGoEnv
+	installCommunityTool = communitytool.Install
+	pathEnvEntries       = func(profile system.PlatformProfile) []string {
+		return splitPathForOS(os.Getenv("PATH"), profile.OS)
+	}
+	addUserPath         = system.AddToUserPath
+	ensureUserPathFirst = system.PrioritizeUserPath
+	userPathEntries     = system.UserPathEntries
 
 	// ggaAvailableCheck is an optional override for ggaAvailable behavior.
 	// When set, it is called instead of the default filesystem check.
@@ -59,7 +70,11 @@ var (
 
 	// engramDownloadFn is the function used to download the engram binary on non-brew platforms.
 	// Package-level var for testability — tests can replace this to avoid real HTTP calls.
-	engramDownloadFn = engram.DownloadLatestBinary
+	// Always uses the stable (release) path; beta channel at install time is handled
+	// separately via installBetaEngramFromMain.
+	engramDownloadFn = func(profile system.PlatformProfile) (string, error) {
+		return engram.DownloadLatestBinary(profile, false)
+	}
 
 	// AppVersion is the gentle-ai version that will be written into backup manifests.
 	// It is set by app.go before any CLI operation so that every backup created during
@@ -117,7 +132,14 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		return result, fmt.Errorf("resolve user home directory: %w", err)
 	}
 
-	runtime, err := newInstallRuntime(homeDir, input.Selection, resolved, profile)
+	if input.Scope == ScopeGlobal {
+		fmt.Fprintf(os.Stderr,
+			"WARNING: installing with --scope=global (default). Agent config files (system prompts, skills/, agents/, etc.)\n"+
+				"will be written to each selected agent's global config directory and will affect ALL workspaces for those agents on this machine.\n"+
+				"To install only into the current workspace, rerun with --scope=workspace.\n\n")
+	}
+
+	runtime, err := newInstallRuntime(homeDir, input.Scope, input.Channel, input.Selection, resolved, profile)
 	if err != nil {
 		return result, err
 	}
@@ -139,7 +161,7 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		return result, fmt.Errorf("execute install pipeline: %w", result.Execution.Err)
 	}
 
-	result.Verify = runPostApplyVerification(homeDir, runtime.workspaceDir, input.Selection, resolved)
+	result.Verify = runPostApplyVerification(homeDir, runtime.workspaceDir, input.Scope, input.Selection, resolved)
 	result.Verify = withPostInstallNotes(result.Verify, resolved)
 	if !result.Verify.Ready {
 		return result, fmt.Errorf("post-apply verification failed:\n%s", verify.RenderReport(result.Verify))
@@ -151,15 +173,72 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 	for _, a := range input.Selection.Agents {
 		agentIDs = append(agentIDs, string(a))
 	}
+
+	// When the user ran `gentle-ai install --agent X` (explicit agent flag),
+	// merge into the existing state so that previously installed agents and
+	// model assignments are preserved. A full install (no --agent flag) keeps
+	// overwrite semantics so the TUI selection is the source of truth.
+	claudePhaseState := claudePhaseAssignmentsToState(input.Selection.ClaudePhaseAssignments)
+	newState := state.InstallState{
+		InstalledAgents:             agentIDs,
+		ClaudeModelAssignments:      claudeLegacyAssignmentsForState(input.Selection.ClaudeModelAssignments, claudePhaseState),
+		ClaudePhaseAssignments:      claudePhaseState,
+		KiroModelAssignments:        kiroAliasesToStrings(input.Selection.KiroModelAssignments),
+		CodexModelAssignments:       codexEffortsToStrings(input.Selection.CodexModelAssignments),
+		CodexCarrilModelAssignments: input.Selection.CodexCarrilModelAssignments,
+		CodexPhaseModelAssignments:  input.Selection.CodexPhaseModelAssignments,
+		ModelAssignments:            modelAssignmentsToState(input.Selection.ModelAssignments),
+		Persona:                     string(input.Selection.Persona),
+	}
+	if len(flags.Agents) > 0 {
+		merged, ok := mergeExplicitAgentInstallState(homeDir, newState, agentIDs)
+		if !ok {
+			return result, nil
+		}
+		newState = merged
+	}
 	// Non-fatal: a state write failure must not break an otherwise successful install.
-	_ = state.Write(homeDir, state.InstallState{
-		InstalledAgents:        agentIDs,
-		ClaudeModelAssignments: claudeAliasesToStrings(input.Selection.ClaudeModelAssignments),
-		ModelAssignments:       modelAssignmentsToState(input.Selection.ModelAssignments),
-		Persona:                string(input.Selection.Persona),
-	})
+	_ = state.Write(homeDir, newState)
 
 	return result, nil
+}
+
+func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState, agentIDs []string) (state.InstallState, bool) {
+	existing, readErr := state.Read(homeDir)
+	if readErr != nil {
+		if errors.Is(readErr, os.ErrNotExist) {
+			return newState, true
+		}
+		return newState, false
+	}
+
+	merged := state.MergeAgents(existing, agentIDs)
+	if newState.ModelAssignments != nil {
+		merged.ModelAssignments = newState.ModelAssignments
+	}
+	if newState.ClaudeModelAssignments != nil {
+		merged.ClaudeModelAssignments = newState.ClaudeModelAssignments
+	}
+	if newState.ClaudePhaseAssignments != nil {
+		merged.ClaudePhaseAssignments = newState.ClaudePhaseAssignments
+		merged.ClaudeModelAssignments = nil
+	}
+	if newState.KiroModelAssignments != nil {
+		merged.KiroModelAssignments = newState.KiroModelAssignments
+	}
+	if newState.CodexModelAssignments != nil {
+		merged.CodexModelAssignments = newState.CodexModelAssignments
+	}
+	if newState.CodexCarrilModelAssignments != nil {
+		merged.CodexCarrilModelAssignments = newState.CodexCarrilModelAssignments
+	}
+	if newState.CodexPhaseModelAssignments != nil {
+		merged.CodexPhaseModelAssignments = newState.CodexPhaseModelAssignments
+	}
+	if merged.Persona == "" && newState.Persona != "" {
+		merged.Persona = newState.Persona
+	}
+	return merged, true
 }
 
 func withPostInstallNotes(report verify.Report, resolved planner.ResolvedPlan) verify.Report {
@@ -167,6 +246,22 @@ func withPostInstallNotes(report verify.Report, resolved planner.ResolvedPlan) v
 		report.FinalNote = report.FinalNote + "\n\nGGA is now installed globally. To enable project hooks, run in each repo:\n- gga init\n- gga install"
 	}
 	report = withGoInstallPathNote(report, resolved)
+	report = withOpenCodeExperimentalNote(report, resolved)
+	return report
+}
+
+// withOpenCodeExperimentalNote appends guidance to enable OpenCode
+// experimental features, but only when OpenCode is among the selected agents.
+// It only prints copy-paste guidance — it never writes to the user's shell
+// config — mirroring the engram PATH guidance pattern.
+func withOpenCodeExperimentalNote(report verify.Report, resolved planner.ResolvedPlan) verify.Report {
+	if !containsAgent(resolved.Agents, model.AgentOpenCode) {
+		return report
+	}
+	report.FinalNote = report.FinalNote + fmt.Sprintf(
+		"\n\nTo enable OpenCode experimental features, add this to your shell:\n  %s",
+		openCodeExperimentalGuidance(os.Getenv("SHELL")),
+	)
 	return report
 }
 
@@ -208,6 +303,74 @@ func goInstallBinDir() string {
 	return filepath.Join("~", "go", "bin")
 }
 
+func defaultGoEnv(keys ...string) (map[string]string, error) {
+	args := append([]string{"env"}, keys...)
+	out, err := exec.Command("go", args...).Output()
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimRight(string(out), "\r\n"), "\n")
+	values := make(map[string]string, len(keys))
+	for i, key := range keys {
+		if i < len(lines) {
+			values[key] = strings.TrimSpace(lines[i])
+		}
+	}
+	return values, nil
+}
+
+func goInstallBinDirFromGoEnv() (string, error) {
+	values, err := goEnv("GOBIN", "GOPATH")
+	if err != nil {
+		return "", err
+	}
+	if gobin := strings.TrimSpace(values["GOBIN"]); gobin != "" {
+		return gobin, nil
+	}
+	if gopath := strings.TrimSpace(values["GOPATH"]); gopath != "" {
+		return filepath.Join(gopath, "bin"), nil
+	}
+	return "", fmt.Errorf("go env returned empty GOBIN and GOPATH")
+}
+
+const engramBetaGoInstallPackage = "github.com/Gentleman-Programming/engram/cmd/engram@main"
+
+func installBetaEngramFromMain() (string, error) {
+	if err := runCommand("go", "install", engramBetaGoInstallPackage); err != nil {
+		return "", err
+	}
+
+	binDir, err := goInstallBinDirFromGoEnv()
+	if err != nil {
+		return "", fmt.Errorf("resolve go install bin dir: %w", err)
+	}
+
+	binaryName := "engram"
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
+	binaryPath := filepath.Join(binDir, binaryName)
+	if err := prependToPath(binDir); err != nil {
+		return "", err
+	}
+	return binaryPath, nil
+}
+
+func prependToPath(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if isInPATH(dir) {
+		return nil
+	}
+	path := os.Getenv("PATH")
+	if path == "" {
+		return osSetenv("PATH", dir)
+	}
+	return osSetenv("PATH", dir+string(os.PathListSeparator)+path)
+}
+
 // isInPATH reports whether dir is present in the current PATH.
 func isInPATH(dir string) bool {
 	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
@@ -243,9 +406,11 @@ func buildStagePlan(selection model.Selection, resolved planner.ResolvedPlan) pi
 type installRuntime struct {
 	homeDir      string
 	workspaceDir string
+	scope        InstallScope
 	selection    model.Selection
 	resolved     planner.ResolvedPlan
 	profile      system.PlatformProfile
+	channel      InstallChannel
 	backupRoot   string
 	state        *runtimeState
 }
@@ -254,7 +419,7 @@ type runtimeState struct {
 	manifest backup.Manifest
 }
 
-func newInstallRuntime(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile) (*installRuntime, error) {
+func newInstallRuntime(homeDir string, scope InstallScope, channel InstallChannel, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile) (*installRuntime, error) {
 	backupRoot := filepath.Join(homeDir, ".gentle-ai", "backups")
 	if err := os.MkdirAll(backupRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create backup root directory %q: %w", backupRoot, err)
@@ -266,16 +431,18 @@ func newInstallRuntime(homeDir string, selection model.Selection, resolved plann
 	return &installRuntime{
 		homeDir:      homeDir,
 		workspaceDir: workspaceDir,
+		scope:        scope,
 		selection:    selection,
 		resolved:     resolved,
 		profile:      profile,
+		channel:      channel,
 		backupRoot:   backupRoot,
 		state:        &runtimeState{},
 	}, nil
 }
 
 func (r *installRuntime) stagePlan() pipeline.StagePlan {
-	targets := backupTargets(r.homeDir, r.workspaceDir, r.selection, r.resolved)
+	targets := backupTargets(r.homeDir, r.workspaceDir, r.scope, r.selection, r.resolved)
 	prepare := []pipeline.Step{
 		checkDependenciesStep{id: "prepare:check-dependencies", profile: r.profile, homeDir: r.homeDir, selection: r.selection},
 		prepareBackupStep{
@@ -291,7 +458,7 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 		},
 	}
 
-	apply := make([]pipeline.Step, 0, len(r.resolved.Agents)+len(r.resolved.OrderedComponents)+1)
+	apply := make([]pipeline.Step, 0, len(r.resolved.Agents)+len(r.selection.CommunityTools)+len(r.resolved.OrderedComponents)+1)
 	apply = append(apply, rollbackRestoreStep{id: "apply:rollback-restore", state: r.state})
 
 	// Before installing components, ensure modular agents have their system prompt hub.
@@ -313,15 +480,21 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 		}
 	}
 
+	for _, tool := range r.selection.CommunityTools {
+		apply = append(apply, communityToolInstallStep{id: "community-tool:" + string(tool), tool: tool, workspaceDir: r.workspaceDir})
+	}
+
 	for _, component := range r.resolved.OrderedComponents {
 		apply = append(apply, componentApplyStep{
 			id:           "component:" + string(component),
 			component:    component,
 			homeDir:      r.homeDir,
 			workspaceDir: r.workspaceDir,
+			scope:        r.scope,
 			agents:       r.resolved.Agents,
 			selection:    r.selection,
 			profile:      r.profile,
+			channel:      r.channel,
 		})
 	}
 
@@ -498,9 +671,27 @@ type componentApplyStep struct {
 	component    model.ComponentID
 	homeDir      string
 	workspaceDir string
+	scope        InstallScope
 	agents       []model.AgentID
 	selection    model.Selection
 	profile      system.PlatformProfile
+	channel      InstallChannel
+}
+
+type communityToolInstallStep struct {
+	id           string
+	tool         model.CommunityToolID
+	workspaceDir string
+}
+
+func (s communityToolInstallStep) ID() string { return s.id }
+
+func (s communityToolInstallStep) Run() error {
+	_, err := installCommunityTool(s.tool, s.workspaceDir, communitytool.RunnerFunc(runCommand))
+	if err != nil {
+		return fmt.Errorf("install community tool %q: %w", s.tool, err)
+	}
+	return nil
 }
 
 func (s componentApplyStep) ID() string {
@@ -520,12 +711,87 @@ func resolveAdapters(agentIDs []model.AgentID) []agents.Adapter {
 	return adapters
 }
 
+func shouldRefreshWindowsEngram(profile system.PlatformProfile, resolvedPath string, pathEntries []string) bool {
+	if profile.OS != "windows" || profile.PackageManager == "brew" || strings.TrimSpace(resolvedPath) == "" {
+		return false
+	}
+	return len(engramBinaryDirsOnPath(pathEntries, profile.OS)) > 1
+}
+
+func ensureRepairableWindowsEngramShadowing(profile system.PlatformProfile, installedPath, managedDir string) error {
+	userEntries, err := userPathEntries(profile.OS)
+	if err != nil {
+		return fmt.Errorf("read user PATH: %w", err)
+	}
+
+	staleDir := filepath.Dir(installedPath)
+	if !pathEntriesContainDir(userEntries, staleDir) {
+		return fmt.Errorf("%s is not in the user PATH, so user-scoped PATH repair cannot guarantee future shells will resolve %s before %s", staleDir, managedDir, staleDir)
+	}
+
+	return nil
+}
+
+func pathEntriesContainDir(entries []string, dir string) bool {
+	dir = strings.Trim(strings.TrimSpace(dir), `"`)
+	if dir == "" {
+		return false
+	}
+	for _, entry := range entries {
+		entry = strings.Trim(strings.TrimSpace(entry), `"`)
+		if entry == "" {
+			continue
+		}
+		if strings.EqualFold(filepath.Clean(entry), filepath.Clean(dir)) {
+			return true
+		}
+	}
+	return false
+}
+
+func engramBinaryDirsOnPath(pathEntries []string, goos string) []string {
+	var dirs []string
+	for _, entry := range pathEntries {
+		entry = strings.Trim(strings.TrimSpace(entry), `"`)
+		if entry == "" {
+			continue
+		}
+		binaryName := "engram"
+		if goos == "windows" {
+			binaryName = "engram.exe"
+		}
+		candidate := filepath.Join(entry, binaryName)
+		if _, err := os.Stat(candidate); err == nil {
+			dirs = append(dirs, entry)
+		}
+	}
+	return dirs
+}
+
+func splitPathForOS(value, goos string) []string {
+	separator := string(os.PathListSeparator)
+	if goos == "windows" {
+		separator = ";"
+	}
+	if value == "" {
+		return nil
+	}
+	return strings.Split(value, separator)
+}
+
 func (s componentApplyStep) Run() error {
 	adapters := resolveAdapters(s.agents)
 
 	switch s.component {
 	case model.ComponentEngram:
-		if _, err := cmdLookPath("engram"); err != nil {
+		engramCommand := "engram"
+		if s.channel.IsBeta() {
+			binaryPath, err := installBetaEngramFromMain()
+			if err != nil {
+				return fmt.Errorf("install beta engram from main: %w", err)
+			}
+			engramCommand = binaryPath
+		} else if installedPath, err := cmdLookPath("engram"); err != nil {
 			// Engram not on PATH — install it.
 			if s.profile.PackageManager == "brew" {
 				// macOS (or Linux with Homebrew): use brew tap + brew install.
@@ -547,11 +813,25 @@ func (s componentApplyStep) Run() error {
 				// (engram setup, engram.Inject → resolveEngramCommand) can find it.
 				// On Windows this also persists the change to the user registry via PowerShell.
 				binDir := filepath.Dir(binaryPath)
-				if err := system.AddToUserPath(binDir); err != nil {
+				if err := addUserPath(binDir); err != nil {
 					// Non-fatal: warn but continue — the binary was downloaded successfully.
 					fmt.Fprintf(os.Stderr, "WARNING: could not add %s to PATH: %v\n", binDir, err)
 				}
 			}
+		} else if shouldRefreshWindowsEngram(s.profile, installedPath, pathEnvEntries(s.profile)) {
+			binaryPath, err := engramDownloadFn(s.profile)
+			if err != nil {
+				return fmt.Errorf("refresh shadowed engram binary: %w", err)
+			}
+			engramCommand = binaryPath
+			binDir := filepath.Dir(binaryPath)
+			if err := ensureRepairableWindowsEngramShadowing(s.profile, installedPath, binDir); err != nil {
+				return fmt.Errorf("repair Windows Engram PATH shadowing: refreshed managed Engram at %s, but cannot safely repair PATH order: %w. Move %s before %s in your user PATH or remove the stale Machine/System PATH entry, then rerun install", binaryPath, err, binDir, filepath.Dir(installedPath))
+			}
+			if err := ensureUserPathFirst(binDir); err != nil {
+				return fmt.Errorf("repair Windows Engram PATH shadowing: refreshed managed Engram at %s, but could not move %s ahead of stale PATH entry %s: %w. Move %s before %s in your user PATH, then rerun install", binaryPath, binDir, installedPath, err, binDir, filepath.Dir(installedPath))
+			}
+			fmt.Fprintf(os.Stderr, "WARNING: multiple engram.exe entries were found on PATH and %s resolved first. Refreshed managed Engram at %s and moved %s ahead of the stale entry in the user PATH.\n", installedPath, binaryPath, binDir)
 		}
 		setupMode := engram.ParseSetupMode(os.Getenv(engram.SetupModeEnvVar))
 		setupStrict := engram.ParseSetupStrict(os.Getenv(engram.SetupStrictEnvVar))
@@ -560,7 +840,7 @@ func (s componentApplyStep) Run() error {
 			if engram.ShouldAttemptSetup(setupMode, adapter.Agent()) {
 				slug, _ := engram.SetupAgentSlug(adapter.Agent())
 				if _, seen := attemptedSlugs[slug]; !seen {
-					if err := runCommand("engram", "setup", slug); err != nil {
+					if err := runCommand(engramCommand, "setup", slug); err != nil {
 						if setupStrict {
 							return fmt.Errorf("engram setup for %q: %w", adapter.Agent(), err)
 						}
@@ -568,12 +848,16 @@ func (s componentApplyStep) Run() error {
 					attemptedSlugs[slug] = struct{}{}
 				}
 			}
+			engramOpts := engram.InjectOptions{
+				CodexCarrilModelAssignments: s.selection.CodexCarrilModelAssignments,
+				CodexModelAssignments:       s.selection.CodexModelAssignments,
+			}
 			var err error
 			if adapter.Agent() == model.AgentOpenClaw {
 				_, err = engram.InjectWithPromptDir(s.homeDir, s.workspaceDir, adapter)
 			} else {
-				targetDir := componentInjectionDir(s.homeDir, s.workspaceDir, adapter)
-				_, err = engram.Inject(targetDir, adapter)
+				targetDir := componentInjectionDirScoped(s.homeDir, s.workspaceDir, s.scope, adapter)
+				_, err = engram.InjectWithOptions(targetDir, adapter, engramOpts)
 			}
 			if err != nil {
 				return fmt.Errorf("inject engram for %q: %w", adapter.Agent(), err)
@@ -589,7 +873,7 @@ func (s componentApplyStep) Run() error {
 		return nil
 	case model.ComponentPersona:
 		for _, adapter := range adapters {
-			targetDir := componentInjectionDir(s.homeDir, s.workspaceDir, adapter)
+			targetDir := componentInjectionDirScoped(s.homeDir, s.workspaceDir, s.scope, adapter)
 			if _, err := persona.Inject(targetDir, adapter, s.selection.Persona); err != nil {
 				return fmt.Errorf("inject persona for %q: %w", adapter.Agent(), err)
 			}
@@ -604,13 +888,17 @@ func (s componentApplyStep) Run() error {
 		return nil
 	case model.ComponentSDD:
 		for _, adapter := range adapters {
-			targetDir := componentInjectionDir(s.homeDir, s.workspaceDir, adapter)
+			targetDir := componentInjectionDirScoped(s.homeDir, s.workspaceDir, s.scope, adapter)
 			opts := sdd.InjectOptions{
-				OpenCodeModelAssignments: s.selection.ModelAssignments,
-				ClaudeModelAssignments:   s.selection.ClaudeModelAssignments,
-				KiroModelAssignments:     s.selection.KiroModelAssignments,
-				WorkspaceDir:             s.workspaceDir,
-				StrictTDD:                s.selection.StrictTDD,
+				OpenCodeModelAssignments:    s.selection.ModelAssignments,
+				ClaudeModelAssignments:      s.selection.ClaudeModelAssignments,
+				ClaudePhaseAssignments:      s.selection.ClaudePhaseAssignments,
+				KiroModelAssignments:        s.selection.KiroModelAssignments,
+				CodexModelAssignments:       s.selection.CodexModelAssignments,
+				CodexCarrilModelAssignments: s.selection.CodexCarrilModelAssignments,
+				CodexPhaseModelAssignments:  s.selection.CodexPhaseModelAssignments,
+				WorkspaceDir:                s.workspaceDir,
+				StrictTDD:                   s.selection.StrictTDD,
 			}
 			if _, err := sdd.Inject(targetDir, adapter, s.selection.SDDMode, opts); err != nil {
 				return fmt.Errorf("inject sdd for %q: %w", adapter.Agent(), err)
@@ -623,7 +911,8 @@ func (s componentApplyStep) Run() error {
 			return nil
 		}
 		for _, adapter := range adapters {
-			if _, err := skills.Inject(s.homeDir, adapter, skillIDs); err != nil {
+			targetDir := componentInjectionDirScoped(s.homeDir, s.workspaceDir, s.scope, adapter)
+			if _, err := skills.Inject(targetDir, adapter, skillIDs); err != nil {
 				return fmt.Errorf("inject skills for %q: %w", adapter.Agent(), err)
 			}
 		}
@@ -658,10 +947,13 @@ func (s componentApplyStep) Run() error {
 			if err := gga.EnsurePowerShellShim(s.homeDir); err != nil {
 				return fmt.Errorf("ensure gga powershell shim: %w", err)
 			}
+			if err := gga.EnsureCommandShim(s.homeDir); err != nil {
+				return fmt.Errorf("ensure gga command shim: %w", err)
+			}
 			// Add GGA bin dir to the user PATH persistently on Windows.
 			// GGA's install.sh drops the binary into ~/bin which is not on PATH by default.
 			ggaBinDir := filepath.Join(s.homeDir, "bin")
-			if err := system.AddToUserPath(ggaBinDir); err != nil {
+			if err := addUserPath(ggaBinDir); err != nil {
 				// Non-fatal: warn but continue — GGA was installed successfully.
 				fmt.Fprintf(os.Stderr, "WARNING: could not add %s to PATH: %v\n", ggaBinDir, err)
 			}
@@ -733,13 +1025,19 @@ func windowsGoCandidates() []string {
 
 // BuildRealStagePlan creates a StagePlan with real backup, agent install, and component apply steps.
 // It is used by both the CLI and TUI paths.
-func BuildRealStagePlan(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile) (pipeline.StagePlan, error) {
+// scope controls where agent config files are written (ScopeGlobal writes to homeDir, ScopeWorkspace writes to cwd).
+func BuildRealStagePlan(homeDir string, scope InstallScope, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile) (pipeline.StagePlan, error) {
 	backupRoot := filepath.Join(homeDir, ".gentle-ai", "backups")
 	if err := os.MkdirAll(backupRoot, 0o755); err != nil {
 		return pipeline.StagePlan{}, fmt.Errorf("create backup root directory %q: %w", backupRoot, err)
 	}
 
-	runtime, err := newInstallRuntime(homeDir, selection, resolved, profile)
+	channel, err := ResolveInstallChannel("")
+	if err != nil {
+		return pipeline.StagePlan{}, err
+	}
+
+	runtime, err := newInstallRuntime(homeDir, scope, channel, selection, resolved, profile)
 	if err != nil {
 		return pipeline.StagePlan{}, err
 	}
@@ -851,12 +1149,12 @@ func selectedSkillIDs(selection model.Selection) []model.SkillID {
 	return skills.SkillsForPreset(selection.Preset)
 }
 
-func backupTargets(homeDir, workspaceDir string, selection model.Selection, resolved planner.ResolvedPlan) []string {
+func backupTargets(homeDir, workspaceDir string, scope InstallScope, selection model.Selection, resolved planner.ResolvedPlan) []string {
 	paths := map[string]struct{}{}
 	adapters := resolveAdapters(resolved.Agents)
 
 	for _, component := range resolved.OrderedComponents {
-		for _, path := range componentPathsWithWorkspace(homeDir, workspaceDir, selection, adapters, component) {
+		for _, path := range componentPathsWithWorkspaceScoped(homeDir, workspaceDir, scope, selection, adapters, component) {
 			paths[path] = struct{}{}
 		}
 	}
@@ -874,9 +1172,13 @@ func componentPaths(homeDir string, selection model.Selection, adapters []agents
 }
 
 func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.Selection, adapters []agents.Adapter, component model.ComponentID) []string {
+	return componentPathsWithWorkspaceScoped(homeDir, workspaceDir, ScopeGlobal, selection, adapters, component)
+}
+
+func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope InstallScope, selection model.Selection, adapters []agents.Adapter, component model.ComponentID) []string {
 	paths := []string{}
 	for _, adapter := range adapters {
-		targetDir := componentPathDir(homeDir, workspaceDir, adapter, component)
+		targetDir := componentPathDirScoped(homeDir, workspaceDir, scope, adapter, component)
 		switch component {
 		case model.ComponentEngram:
 			switch adapter.MCPStrategy() {
@@ -903,6 +1205,10 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 			case model.StrategyTOMLFile:
 				if p := adapter.MCPConfigPath(targetDir, "engram"); p != "" {
 					paths = append(paths, p)
+					// Track the gentle-ai SDD profile files written alongside
+					// the Codex config.toml so they are removed on uninstall.
+					codexHomeDir := filepath.Dir(p)
+					paths = append(paths, codexagent.SddProfilePaths(codexHomeDir)...)
 				}
 			}
 			if adapter.SystemPromptStrategy() == model.StrategyMarkdownSections {
@@ -916,24 +1222,21 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 			}
 			if adapter.SupportsSlashCommands() {
 				for _, command := range sdd.OpenCodeCommands() {
-					paths = append(paths, filepath.Join(adapter.CommandsDir(homeDir), command.Name+".md"))
+					paths = append(paths, filepath.Join(adapter.CommandsDir(targetDir), command.Name+".md"))
 				}
 			}
 			if adapter.Agent() == model.AgentOpenCode {
-				if p := adapter.SettingsPath(homeDir); p != "" {
+				if p := adapter.SettingsPath(targetDir); p != "" {
 					paths = append(paths, p)
 				}
-				paths = append(paths,
-					filepath.Join(homeDir, ".config", "opencode", "plugins", "background-agents.ts"),
-					filepath.Join(homeDir, ".config", "opencode", "plugins", "model-variants.ts"),
-				)
-				// Shared prompt files in ~/.config/opencode/prompts/sdd/ — back these up
+				paths = append(paths, openCodeSDDPluginPaths(targetDir)...)
+				// Shared prompt files in the selected OpenCode config scope — back these up
 				// so a sync does not silently overwrite user-customized prompt content.
 				// These files are only written for multi-mode (SDDModeMulti), so we only
 				// include them in the path list when that mode is active. This prevents
 				// false-negative verification failures in single/empty mode syncs.
 				if selection.SDDMode == model.SDDModeMulti {
-					promptDir := sdd.SharedPromptDir(homeDir)
+					promptDir := sdd.SharedPromptDir(targetDir)
 					for _, phase := range sdd.SharedPromptPhases() {
 						paths = append(paths, filepath.Join(promptDir, phase+".md"))
 					}
@@ -947,6 +1250,7 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 						filepath.Join(skillDir, "_shared", "engram-convention.md"),
 						filepath.Join(skillDir, "_shared", "openspec-convention.md"),
 						filepath.Join(skillDir, "_shared", "sdd-phase-common.md"),
+						filepath.Join(skillDir, "_shared", "sdd-status-contract.md"),
 						filepath.Join(skillDir, "_shared", "skill-resolver.md"),
 						filepath.Join(skillDir, "sdd-init", "SKILL.md"),
 						filepath.Join(skillDir, "sdd-explore", "SKILL.md"),
@@ -960,13 +1264,13 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 					)
 				}
 			}
-			paths = append(paths, sddSubAgentPaths(homeDir, adapter)...)
+			paths = append(paths, sddSubAgentPaths(targetDir, adapter)...)
 		case model.ComponentSkills:
 			for _, skillID := range selectedSkillIDs(selection) {
 				if skills.IsSDDSkill(skillID) {
 					continue
 				}
-				path := skills.SkillPathForAgent(homeDir, adapter, skillID)
+				path := skills.SkillPathForAgent(targetDir, adapter, skillID)
 				if path != "" {
 					paths = append(paths, path)
 				}
@@ -984,8 +1288,9 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 					paths = append(paths, p)
 				}
 			case model.StrategyTOMLFile:
-				// Codex uses TOML for Engram but Context7 is not injected via TOML.
-				// No path to report — Context7 injection is skipped for TOML agents.
+				if p := adapter.MCPConfigPath(homeDir, "context7"); p != "" {
+					paths = append(paths, p)
+				}
 			}
 		case model.ComponentPersona:
 			if selection.Persona == model.PersonaCustom {
@@ -998,16 +1303,16 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 			if adapter.SupportsSystemPrompt() && adapter.SystemPromptStrategy() != model.StrategyJinjaModules {
 				paths = append(paths, adapter.SystemPromptFile(targetDir))
 			}
-			if selection.Persona == model.PersonaGentleman {
+			if managedOutputStyleName(selection.Persona) != "" {
 				if adapter.SupportsOutputStyles() {
-					paths = append(paths, adapter.OutputStyleDir(targetDir)+"/gentleman.md")
+					paths = append(paths, filepath.Join(adapter.OutputStyleDir(targetDir), managedOutputStyleFile(selection.Persona)))
 					if p := adapter.SettingsPath(targetDir); p != "" {
 						paths = append(paths, p)
 					}
 				}
 			}
 		case model.ComponentPermission:
-			if p := adapter.SettingsPath(homeDir); p != "" {
+			if p := permissions.TargetPath(homeDir, adapter); p != "" {
 				paths = append(paths, p)
 			}
 		case model.ComponentGGA:
@@ -1043,10 +1348,18 @@ func componentPathsWithWorkspace(homeDir, workspaceDir string, selection model.S
 }
 
 func componentInjectionDir(homeDir, workspaceDir string, adapter agents.Adapter) string {
+	return componentInjectionDirScoped(homeDir, workspaceDir, ScopeGlobal, adapter)
+}
+
+// componentInjectionDirScoped returns the directory to inject component files for the given adapter,
+// taking the install scope into account. When scope is ScopeWorkspace, agent-scoped
+// components write to workspaceDir instead of the selected agent's global config root.
+// OpenClaw always uses workspaceDir when set, independent of scope.
+func componentInjectionDirScoped(homeDir, workspaceDir string, scope InstallScope, adapter agents.Adapter) string {
 	if adapter.Agent() == model.AgentOpenClaw && strings.TrimSpace(workspaceDir) != "" {
 		return workspaceDir
 	}
-	return homeDir
+	return ResolveAgentConfigDir(scope, homeDir, workspaceDir)
 }
 
 type openClawWorkspaceConfig struct {
@@ -1088,9 +1401,13 @@ func resolveOpenClawWorkspaceDir(homeDir, fallback string, agentIDs []model.Agen
 }
 
 func componentPathDir(homeDir, workspaceDir string, adapter agents.Adapter, component model.ComponentID) string {
+	return componentPathDirScoped(homeDir, workspaceDir, ScopeGlobal, adapter, component)
+}
+
+func componentPathDirScoped(homeDir, workspaceDir string, scope InstallScope, adapter agents.Adapter, component model.ComponentID) string {
 	switch component {
-	case model.ComponentEngram, model.ComponentSDD, model.ComponentPersona:
-		return componentInjectionDir(homeDir, workspaceDir, adapter)
+	case model.ComponentEngram, model.ComponentSDD, model.ComponentPersona, model.ComponentSkills:
+		return componentInjectionDirScoped(homeDir, workspaceDir, scope, adapter)
 	default:
 		return homeDir
 	}
@@ -1117,14 +1434,22 @@ func sddSubAgentPaths(homeDir string, adapter agents.Adapter) []string {
 	return paths
 }
 
-func runPostApplyVerification(homeDir, workspaceDir string, selection model.Selection, resolved planner.ResolvedPlan) verify.Report {
+func openCodeSDDPluginPaths(targetDir string) []string {
+	return []string{
+		filepath.Join(targetDir, ".config", "opencode", "plugins", "background-agents.ts"),
+		filepath.Join(targetDir, ".config", "opencode", "plugins", "model-variants.ts"),
+		filepath.Join(targetDir, ".config", "opencode", "plugins", "skill-registry.ts"),
+	}
+}
+
+func runPostApplyVerification(homeDir, workspaceDir string, scope InstallScope, selection model.Selection, resolved planner.ResolvedPlan) verify.Report {
 	checks := make([]verify.Check, 0)
 	adapters := resolveAdapters(resolved.Agents)
 
 	seenPath := make(map[string]struct{})
 	var uniqueFilePaths []string
 	for _, component := range resolved.OrderedComponents {
-		for _, path := range componentPathsWithWorkspace(homeDir, workspaceDir, selection, adapters, component) {
+		for _, path := range componentPathsWithWorkspaceScoped(homeDir, workspaceDir, scope, selection, adapters, component) {
 			if path == "" {
 				continue
 			}
@@ -1138,6 +1463,22 @@ func runPostApplyVerification(homeDir, workspaceDir string, selection model.Sele
 
 	for _, currentPath := range uniqueFilePaths {
 		path := currentPath
+		if isLegacyOpenCodeBackgroundAgentsPlugin(path) {
+			checks = append(checks, verify.Check{
+				ID:          "verify:file:" + path,
+				Description: "legacy OpenCode background agents plugin removed",
+				Run: func(context.Context) error {
+					if _, err := os.Stat(path); err != nil {
+						if os.IsNotExist(err) {
+							return nil
+						}
+						return err
+					}
+					return fmt.Errorf("legacy OpenCode plugin still exists")
+				},
+			})
+			continue
+		}
 		checks = append(checks, verify.Check{
 			ID:          "verify:file:" + path,
 			Description: "required file exists",
@@ -1156,6 +1497,17 @@ func runPostApplyVerification(homeDir, workspaceDir string, selection model.Sele
 	checks = append(checks, antigravityCollisionCheck(resolved.Agents)...)
 
 	return verify.BuildReport(verify.RunChecks(context.Background(), checks))
+}
+
+func isLegacyOpenCodeBackgroundAgentsPlugin(path string) bool {
+	path = filepath.Clean(path)
+	pluginsDir := filepath.Dir(path)
+	opencodeDir := filepath.Dir(pluginsDir)
+	configDir := filepath.Dir(opencodeDir)
+	return filepath.Base(path) == "background-agents.ts" &&
+		filepath.Base(pluginsDir) == "plugins" &&
+		filepath.Base(opencodeDir) == "opencode" &&
+		filepath.Base(configDir) == ".config"
 }
 
 func hasComponent(components []model.ComponentID, target model.ComponentID) bool {
@@ -1206,21 +1558,22 @@ func engramHealthChecks() []verify.Check {
 }
 
 // antigravityCollisionCheck returns a soft verify check that warns the user
-// when both Antigravity and Gemini CLI are selected. Both agents write to
-// ~/.gemini/GEMINI.md — content is merged (not overwritten) but the user
-// should be aware.
+// when Antigravity and Gemini CLI are selected together. These agents
+// intentionally share ~/.gemini/GEMINI.md because Antigravity uses a
+// Gemini-compatible prompt surface; the last synced SDD orchestrator owns the
+// shared gentle-ai:sdd-orchestrator section.
 func antigravityCollisionCheck(agents []model.AgentID) []verify.Check {
-	hasAntigravity := false
+	hasAntigravitySurface := false
 	hasGemini := false
 	for _, id := range agents {
 		if id == model.AgentAntigravity {
-			hasAntigravity = true
+			hasAntigravitySurface = true
 		}
 		if id == model.AgentGeminiCLI {
 			hasGemini = true
 		}
 	}
-	if !hasAntigravity || !hasGemini {
+	if !hasAntigravitySurface || !hasGemini {
 		return nil
 	}
 	return []verify.Check{
@@ -1230,9 +1583,9 @@ func antigravityCollisionCheck(agents []model.AgentID) []verify.Check {
 			Soft:        true,
 			Run: func(context.Context) error {
 				return fmt.Errorf(
-					"both Antigravity and Gemini CLI write rules to ~/.gemini/GEMINI.md\n" +
-						"Content is merged, not overwritten — rules from both agents coexist in the same file.\n" +
-						"This is expected behavior. No action required unless you want to separate them manually.",
+					"Antigravity and Gemini CLI write rules to ~/.gemini/GEMINI.md\n" +
+						"Antigravity intentionally uses the Gemini-compatible global prompt surface; the last synced SDD orchestrator owns the shared gentle-ai:sdd-orchestrator section.\n" +
+						"Prefer Antigravity for new installs; keep Gemini CLI selected only when you intentionally want that legacy prompt to be the active one.",
 				)
 			},
 		},
@@ -1251,6 +1604,23 @@ func engramPathGuidance(shellPath string) string {
 		return fmt.Sprintf("echo 'export PATH=\"%s:$PATH\"' >> ~/.bashrc && source ~/.bashrc", binDir)
 	}
 	return fmt.Sprintf("Add %s to your shell PATH and restart the terminal.", binDir)
+}
+
+// openCodeExperimentalGuidance returns shell-aware copy-paste guidance to
+// persist OPENCODE_EXPERIMENTAL=true. It only produces a command string and
+// never writes to the user's shell config files.
+func openCodeExperimentalGuidance(shellPath string) string {
+	if strings.Contains(shellPath, "fish") {
+		return "set -Ux OPENCODE_EXPERIMENTAL true"
+	}
+	if strings.Contains(shellPath, "zsh") {
+		return "echo 'export OPENCODE_EXPERIMENTAL=true' >> ~/.zshrc && source ~/.zshrc"
+	}
+	if strings.Contains(shellPath, "bash") {
+		return "echo 'export OPENCODE_EXPERIMENTAL=true' >> ~/.bashrc && source ~/.bashrc"
+	}
+	return "Set the OPENCODE_EXPERIMENTAL=true environment variable " +
+		"(on Windows PowerShell: [Environment]::SetEnvironmentVariable('OPENCODE_EXPERIMENTAL','true','User'))."
 }
 
 // checkDependenciesStep verifies that required system dependencies are present.
@@ -1325,6 +1695,56 @@ func claudeAliasesToStrings(m map[string]model.ClaudeModelAlias) map[string]stri
 		if k == "orchestrator" {
 			continue
 		}
+		out[k] = string(v)
+	}
+	return out
+}
+
+func claudeLegacyAssignmentsForState(
+	legacy map[string]model.ClaudeModelAlias,
+	phase map[string]state.ClaudePhaseAssignmentState,
+) map[string]string {
+	if len(phase) > 0 {
+		return nil
+	}
+	return claudeAliasesToStrings(legacy)
+}
+
+func claudePhaseAssignmentsToState(m map[string]model.ClaudePhaseAssignment) map[string]state.ClaudePhaseAssignmentState {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]state.ClaudePhaseAssignmentState, len(m))
+	for k, v := range m {
+		if k == "orchestrator" || !v.Valid() {
+			continue
+		}
+		out[k] = state.ClaudePhaseAssignmentState{Model: string(v.Model), Effort: string(v.Effort)}
+	}
+	return out
+}
+
+// kiroAliasesToStrings converts a typed KiroModelAlias map to plain strings
+// for JSON serialisation in state.json.
+func kiroAliasesToStrings(m map[string]model.KiroModelAlias) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = string(v)
+	}
+	return out
+}
+
+// codexEffortsToStrings converts a typed CodexEffort map to plain strings
+// for JSON serialisation in state.json.
+func codexEffortsToStrings(m map[string]model.CodexEffort) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
 		out[k] = string(v)
 	}
 	return out

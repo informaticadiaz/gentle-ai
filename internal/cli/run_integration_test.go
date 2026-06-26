@@ -47,6 +47,13 @@ func stringSliceContains(items []string, want string) bool {
 	return false
 }
 
+func engramInitCommandForTest() string {
+	if _, err := exec.LookPath("pnpm"); err == nil {
+		return "pnpm dlx gentle-engram@latest pi-engram init"
+	}
+	return "npm exec --yes --package gentle-engram@latest -- pi-engram init"
+}
+
 func TestRunInstallAppliesFilesystemChanges(t *testing.T) {
 	home := t.TempDir()
 	restoreHome := osUserHomeDir
@@ -101,7 +108,9 @@ func TestRunInstallEngramForPiAndOpenCodeProvisionsBothMCPTargets(t *testing.T) 
 	runCommand = func(name string, args ...string) error {
 		commands = append(commands, strings.Join(append([]string{name}, args...), " "))
 		// Simulate pi-engram init writing mcp.json with the new schema.
-		if name == "npm" && len(args) >= 7 && args[5] == "pi-engram" && args[6] == "init" {
+		isNpmEngramInit := name == "npm" && len(args) >= 7 && args[5] == "pi-engram" && args[6] == "init"
+		isPnpmEngramInit := name == "pnpm" && len(args) >= 4 && args[2] == "pi-engram" && args[3] == "init"
+		if isNpmEngramInit || isPnpmEngramInit {
 			mcpPath := filepath.Join(home, ".pi", "agent", "mcp.json")
 			if err := os.MkdirAll(filepath.Dir(mcpPath), 0o755); err != nil {
 				return err
@@ -129,10 +138,12 @@ func TestRunInstallEngramForPiAndOpenCodeProvisionsBothMCPTargets(t *testing.T) 
 	assertFileContains(t, filepath.Join(home, ".pi", "npm", "package.json"), "pi-mcp-adapter")
 	assertFileContains(t, filepath.Join(home, ".config", "opencode", "opencode.json"), "engram")
 
-	for _, want := range []string{"pi install npm:pi-mcp-adapter", fmt.Sprintf("npm exec --yes --package gentle-engram@%s -- pi-engram init", versions.GentleEngram)} {
-		if !stringSliceContains(commands, want) {
-			t.Fatalf("commands missing %q; got %v", want, commands)
-		}
+	if !stringSliceContains(commands, "pi install npm:pi-mcp-adapter") {
+		t.Fatalf("commands missing %q; got %v", "pi install npm:pi-mcp-adapter", commands)
+	}
+	if !stringSliceContains(commands, "npm exec --yes --package gentle-engram@latest -- pi-engram init") &&
+		!stringSliceContains(commands, "pnpm dlx gentle-engram@latest pi-engram init") {
+		t.Fatalf("commands missing Engram init command; got %v", commands)
 	}
 }
 
@@ -144,11 +155,21 @@ func TestPiAgentInstallRunsPackageCommandsWhenPiAlreadyInstalled(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+	fakeNpm := filepath.Join(binDir, "npm")
+	if err := os.WriteFile(fakeNpm, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake npm) error = %v", err)
+	}
+
 	restorePreflightLookPath := installcmd.OverrideLookPath(func(name string) (string, error) {
-		if name == "pi" {
+		switch name {
+		case "pi":
 			return fakePi, nil
+		case "npm":
+			// Pi's install runs npm exec for engram init, so npm must be present.
+			return fakeNpm, nil
+		default:
+			return "", exec.ErrNotFound
 		}
-		return "", exec.ErrNotFound
 	})
 	t.Cleanup(restorePreflightLookPath)
 
@@ -175,12 +196,11 @@ func TestPiAgentInstallRunsPackageCommandsWhenPiAlreadyInstalled(t *testing.T) {
 		"pi install npm:gentle-pi",
 		"pi install npm:gentle-engram",
 		"pi install npm:pi-mcp-adapter",
-		fmt.Sprintf("npm exec --yes --package gentle-engram@%s -- pi-engram init", versions.GentleEngram),
-		"pi install npm:pi-subagents",
+		engramInitCommandForTest(),
+		"sh -c : \"${HOME:?HOME is required}\" && tmp=$(mktemp -d) && trap 'rm -rf \"$tmp\"' EXIT && git clone --depth 1 https://github.com/nicobailon/pi-subagents.git \"$tmp/pi-subagents\" && npm install --omit=dev --prefix \"$tmp/pi-subagents\" && rm -rf \"$HOME/.pi/agent/vendor/pi-subagents\" && mkdir -p \"$(dirname \"$HOME/.pi/agent/vendor/pi-subagents\")\" && cp -R \"$tmp/pi-subagents\" \"$HOME/.pi/agent/vendor/pi-subagents\" && pi install \"$HOME/.pi/agent/vendor/pi-subagents\"",
 		"pi install npm:pi-intercom",
 		"pi install npm:@juicesharp/rpiv-ask-user-question",
 		"pi install npm:pi-web-access",
-		"pi install npm:pi-lens",
 		"pi install npm:@juicesharp/rpiv-todo",
 		"pi install npm:pi-btw",
 	} {
@@ -1058,7 +1078,7 @@ func TestRunInstallEngramDefaultModeAttemptsClaudeSetup(t *testing.T) {
 	}
 }
 
-func TestRunInstallAntigravityCopiesGeminiSettingsAfterEngramSetup(t *testing.T) {
+func TestRunInstallAntigravityInitializesCLISettingsAfterEngramSetup(t *testing.T) {
 	home := t.TempDir()
 	restoreHome := osUserHomeDir
 	restoreCommand := runCommand
@@ -1095,13 +1115,13 @@ func TestRunInstallAntigravityCopiesGeminiSettingsAfterEngramSetup(t *testing.T)
 		t.Fatalf("verification ready = false")
 	}
 
-	settingsPath := filepath.Join(home, ".gemini", "antigravity", "settings.json")
+	settingsPath := filepath.Join(home, ".gemini", "antigravity-cli", "settings.json")
 	got, err := os.ReadFile(settingsPath)
 	if err != nil {
 		t.Fatalf("ReadFile(%q) error = %v", settingsPath, err)
 	}
-	if string(got) != "{\"theme\":\"dark\"}\n" {
-		t.Fatalf("antigravity settings = %q, want copied Gemini settings", got)
+	if string(got) != "{}\n" {
+		t.Fatalf("antigravity settings = %q, want initialized empty settings", got)
 	}
 }
 
@@ -1514,6 +1534,7 @@ func TestRunInstallDryRunMatchesActualInstallOpenCodeSDDMulti(t *testing.T) {
 	pluginPaths := []string{
 		filepath.Join(home, ".config", "opencode", "plugins", "background-agents.ts"),
 		filepath.Join(home, ".config", "opencode", "plugins", "model-variants.ts"),
+		filepath.Join(home, ".config", "opencode", "plugins", "skill-registry.ts"),
 	}
 	for _, pluginPath := range pluginPaths {
 		if !containsPath(expectedPaths, pluginPath) {
@@ -1543,11 +1564,23 @@ func TestRunInstallDryRunMatchesActualInstallOpenCodeSDDMulti(t *testing.T) {
 	}
 
 	for _, path := range expectedPaths {
+		if isLegacyOpenCodeBackgroundAgentsPlugin(path) {
+			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("expected legacy OpenCode SDD plugin %q to be removed after install; stat err = %v", path, statErr)
+			}
+			continue
+		}
 		if _, statErr := os.Stat(path); statErr != nil {
 			t.Fatalf("expected dry-run path %q to exist after install: %v", path, statErr)
 		}
 	}
 	for _, pluginPath := range pluginPaths {
+		if isLegacyOpenCodeBackgroundAgentsPlugin(pluginPath) {
+			if _, statErr := os.Stat(pluginPath); !os.IsNotExist(statErr) {
+				t.Fatalf("expected legacy OpenCode SDD plugin %q to be removed after install; stat err = %v", pluginPath, statErr)
+			}
+			continue
+		}
 		if _, statErr := os.Stat(pluginPath); statErr != nil {
 			t.Fatalf("expected OpenCode SDD plugin %q to exist after install: %v", pluginPath, statErr)
 		}
@@ -1826,7 +1859,8 @@ func TestRunInstallCustomPresetExplicitSkillsFlagPopulatesSelection(t *testing.T
 			skillCount++
 		}
 	}
-	// 11 SDD skills (from sdd dep, includes sdd-onboard) + 2 explicit skills (go-testing, branch-pr) + 1 _shared/SKILL.md = 14
+	// 11 SDD skills (includes sdd-onboard, judgment-day) + 2 explicit skills
+	// (go-testing, branch-pr) + 1 _shared/SKILL.md = 14.
 	if skillCount != 14 {
 		t.Fatalf("expected 14 skill files (11 SDD + 2 explicit + 1 _shared), got %d", skillCount)
 	}
@@ -1885,7 +1919,8 @@ func TestRunInstallCustomPresetSkillsNoFlagInstallsNothing(t *testing.T) {
 			}
 		}
 	}
-	// Expect exactly 12 SKILL.md files: 10 SDD phases + judgment-day (from SDD dependency) + 1 _shared/SKILL.md.
+	// Expect exactly 12 SKILL.md files: 10 SDD phases + judgment-day
+	// (from SDD dependency) + 1 _shared/SKILL.md.
 	// The skills component itself adds 0 (no --skills flag, SkillsForPreset(custom) = nil).
 	if skillCount != 12 {
 		t.Fatalf("expected 12 SDD skill files installed by the sdd dependency, got %d", skillCount)
@@ -2180,5 +2215,71 @@ func TestRunInstallKimiAlreadyInstalledDoesNotRequireUV(t *testing.T) {
 
 	if got := recorder.get(); len(got) != 0 {
 		t.Fatalf("expected no install commands when Kimi is already installed, got: %v", got)
+	}
+}
+
+// TestRunInstallWorkspaceScopeVerification verifies the user-visible 'install --scope=workspace'
+// behavior from issue #785. It ensures that when installing with workspace scope:
+// 1. Verification files are written to the workspace directory, NOT the home directory.
+// 2. Post-apply verification succeeds because it checks the workspace skill paths.
+func TestRunInstallWorkspaceScopeVerification(t *testing.T) {
+	home := t.TempDir()
+	workspace := t.TempDir()
+
+	originalCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get current wd: %v", err)
+	}
+
+	restoreHome := osUserHomeDir
+	restoreCommand := runCommand
+	restoreLookPath := cmdLookPath
+	t.Cleanup(func() {
+		osUserHomeDir = restoreHome
+		runCommand = restoreCommand
+		cmdLookPath = restoreLookPath
+		if err := os.Chdir(originalCwd); err != nil {
+			t.Errorf("failed to restore working directory: %v", err)
+		}
+	})
+
+	osUserHomeDir = func() (string, error) { return home, nil }
+	runCommand = func(string, ...string) error { return nil }
+	cmdLookPath = func(name string) (string, error) {
+		return "/usr/local/bin/" + name, nil
+	}
+
+	if err := os.Chdir(workspace); err != nil {
+		t.Fatalf("failed to change working directory to temp workspace: %v", err)
+	}
+
+	// Run install with workspace scope, installing Claude Code agent and skills component
+	args := []string{
+		"--scope", "workspace",
+		"--agent", "claude-code",
+		"--component", "skills",
+		"--preset", "custom",
+		"--skill", "go-testing,branch-pr",
+	}
+
+	result, err := RunInstall(args, system.DetectionResult{})
+	if err != nil {
+		t.Fatalf("RunInstall() error = %v", err)
+	}
+
+	if !result.Verify.Ready {
+		t.Fatalf("post-apply verification failed, report = %#v", result.Verify)
+	}
+
+	// Assert that skill files were written to the workspace directory.
+	expectedWorkspaceSkillFile := filepath.Join(workspace, ".claude", "skills", "go-testing", "SKILL.md")
+	if _, err := os.Stat(expectedWorkspaceSkillFile); err != nil {
+		t.Errorf("expected skill file in workspace %q, but was missing: %v", expectedWorkspaceSkillFile, err)
+	}
+
+	// Assert that no skill files were written to the home directory.
+	unexpectedHomeSkillFile := filepath.Join(home, ".claude", "skills", "go-testing", "SKILL.md")
+	if _, err := os.Stat(unexpectedHomeSkillFile); err == nil {
+		t.Errorf("unexpected skill file found in home directory: %q", unexpectedHomeSkillFile)
 	}
 }

@@ -1,12 +1,13 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Gentle-AI — Install Script for Windows
+    Gentle-AI - Install Script for Windows
     Ecosystem, Frameworks, Workflows for AI coding agents.
 
 .DESCRIPTION
     Downloads and installs the gentle-ai binary for Windows.
     Supports installation via Go or pre-built binary from GitHub Releases.
+    Accepted channels: stable (default), beta, nightly.
 
 .EXAMPLE
     # Run directly:
@@ -20,21 +21,22 @@
     .\install.ps1 -Method binary
     .\install.ps1 -Method go
 
+    # Install the beta channel from main:
+    .\install.ps1 -Channel beta
+
     # Skip checksum verification (not recommended):
     .\install.ps1 -Method binary -Insecure
 #>
 
-[CmdletBinding()]
-param(
-    [ValidateSet("auto", "go", "binary")]
-    [string]$Method = "auto",
-
-    [string]$InstallDir = "",
-
-    [switch]$Insecure
-)
-
 $ErrorActionPreference = "Stop"
+
+# Ensure UTF-8 output so Unicode characters render correctly on all terminals.
+# chcp 65001 sets the console code page; OutputEncoding makes .NET match it.
+# Wrapped in try/catch: under ErrorActionPreference=Stop the .NET setter can
+# throw IOException ("handle is invalid") in non-console hosts (ISE, remoting,
+# some CI pipelines) and abort the whole install. Safe to swallow.
+$null = & chcp 65001 2>$null
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 $GITHUB_OWNER = "Gentleman-Programming"
 $GITHUB_REPO = "gentle-ai"
@@ -68,7 +70,7 @@ function Show-Banner {
     Write-Host " | |_| |  __/ | | | |_| |  __/_____/ ___ \ | | " -ForegroundColor Cyan
     Write-Host "  \____|\___|_| |_|\__|_|\___|    /_/   \_\___|" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  Gentle-AI — Ecosystem, Frameworks, Workflows" -ForegroundColor DarkGray
+    Write-Host "  Gentle-AI - Ecosystem, Frameworks, Workflows" -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -112,7 +114,15 @@ function Test-Prerequisites {
 # ============================================================================
 
 function Get-InstallMethod {
-    param([string]$Forced)
+    param([string]$Forced, [string]$Channel)
+
+    if ($Channel -eq "beta") {
+        if ($Forced -ne "auto" -and $Forced -ne "go") {
+            Stop-WithError "-Channel beta installs Gentle AI from main and only supports -Method go"
+        }
+        Write-Info "Using beta channel - will install $BINARY_NAME from main via go install"
+        return "go"
+    }
 
     if ($Forced -ne "auto") {
         Write-Info "Using forced method: $Forced"
@@ -133,10 +143,19 @@ function Get-InstallMethod {
 # ============================================================================
 
 function Install-ViaGo {
+    param([string]$Channel = "stable")
+
     Write-Step "Installing via go install"
 
-    $goPackage = "github.com/$($GITHUB_OWNER.ToLower())/$GITHUB_REPO/cmd/$BINARY_NAME@latest"
+    $version = if ($Channel -eq "beta") { "main" } else { "latest" }
+    $goPackage = "github.com/$($GITHUB_OWNER.ToLower())/$GITHUB_REPO/cmd/$BINARY_NAME@$version"
     Write-Info "Running: go install $goPackage"
+
+    if ($Channel -eq "beta") {
+        Add-GoEnvPattern -Name "GONOSUMDB" -Pattern "github.com/gentleman-programming/gentle-ai"
+        Add-GoEnvPattern -Name "GOPRIVATE" -Pattern "github.com/gentleman-programming/gentle-ai"
+        Add-GoEnvPattern -Name "GONOPROXY" -Pattern "github.com/gentleman-programming/gentle-ai"
+    }
 
     & go install $goPackage
     if ($LASTEXITCODE -ne 0) {
@@ -155,6 +174,24 @@ function Install-ViaGo {
     }
 
     Write-Success "Installed $BINARY_NAME via go install"
+}
+
+function Add-GoEnvPattern {
+    param(
+        [string]$Name,
+        [string]$Pattern
+    )
+
+    $current = [Environment]::GetEnvironmentVariable($Name, "Process")
+    if (-not $current) {
+        Set-Item -Path "Env:$Name" -Value $Pattern
+        return
+    }
+
+    $patterns = $current.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries).Trim()
+    if ($patterns -contains $Pattern) { return }
+
+    Set-Item -Path "Env:$Name" -Value ("{0},{1}" -f $Pattern, $current)
 }
 
 # ============================================================================
@@ -204,9 +241,9 @@ function Install-ViaBinary {
 
         $fileSize = (Get-Item $archivePath).Length
         if ($fileSize -lt 1000) {
-            Stop-WithError "Downloaded file is suspiciously small ($fileSize bytes). Archive may not exist for this platform."
+            Stop-WithError ("Downloaded file is suspiciously small ({0} bytes). Archive may not exist for this platform." -f $fileSize)
         }
-        Write-Success "Downloaded $archiveName ($fileSize bytes)"
+        Write-Success ("Downloaded {0} ({1} bytes)" -f $archiveName, $fileSize)
 
         # Verify checksum
         Write-Info "Verifying checksum..."
@@ -217,8 +254,25 @@ function Install-ViaBinary {
             $checksums = Get-Content $checksumsPath
             $expectedLine = $checksums | Where-Object { $_ -match $archiveName }
             if ($expectedLine) {
-                $expectedChecksum = ($expectedLine -split "\s+")[0]
-                $actualChecksum = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
+                $expectedChecksum = (($expectedLine -split "\s+")[0]).ToLowerInvariant()
+
+                # Compute SHA256 hash - use Get-FileHash if available (PS 4.0+),
+                # otherwise fall back to .NET cryptography for edge cases where
+                # the cmdlet is unavailable (corrupted install, restricted context, etc.)
+                if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+                    $actualChecksum = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                } else {
+                    # Fallback using .NET for environments where Get-FileHash is unavailable
+                    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+                    $fileStream = [System.IO.File]::OpenRead($archivePath)
+                    try {
+                        $hashBytes = $sha256.ComputeHash($fileStream)
+                        $actualChecksum = [System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLowerInvariant()
+                    } finally {
+                        $fileStream.Close()
+                        $sha256.Dispose()
+                    }
+                }
 
                 if ($actualChecksum -ne $expectedChecksum) {
                     Stop-WithError "Checksum mismatch!`n  Expected: $expectedChecksum`n  Got:      $actualChecksum"
@@ -232,10 +286,11 @@ function Install-ViaBinary {
                 }
             }
         } catch {
+            $reason = $_.Exception.Message
             if ($Insecure) {
-                Write-Warn "Could not download checksums.txt - checksum verification skipped (-Insecure)"
+                Write-Warn ("Could not download checksums.txt from: {0} - {1} - checksum verification skipped (-Insecure)" -f $checksumsUrl, $reason)
             } else {
-                Stop-WithError "Could not download checksums.txt from: $checksumsUrl`nRefusing to install without integrity verification.`nUse -Insecure to skip (not recommended)."
+                Stop-WithError ("Could not download checksums.txt from: {0}`nError: {1}`nRefusing to install without integrity verification.`nUse -Insecure to skip (not recommended)." -f $checksumsUrl, $reason)
             }
         }
 
@@ -265,13 +320,33 @@ function Install-ViaBinary {
 
         Write-Success "Installed $BINARY_NAME to $destPath"
 
-        # Check if install dir is in PATH
-        if ($env:PATH -notlike "*$installDir*") {
-            Write-Warn "$installDir is not in your PATH"
-            Write-Host ""
-            Write-Warn "Run this to add it permanently:"
-            Write-Host "  [Environment]::SetEnvironmentVariable('PATH', `$env:PATH + ';$installDir', 'User')" -ForegroundColor DarkGray
-            Write-Host ""
+        # Persist install dir to the User PATH if not already present.
+        # NOTE: [Environment]::GetEnvironmentVariable reads the registry value
+        # after Windows expands any embedded %VAR% references, so REG_EXPAND_SZ
+        # variables (e.g. %USERPROFILE%) are flattened to their current values.
+        # This is a Windows API limitation when using the managed .NET accessor;
+        # a fully lossless round-trip would require the Win32 Registry class with
+        # GetValue(..., DoNotExpandEnvironmentNames). We accept the trade-off here
+        # because user PATH entries that rely on unexpanded refs are uncommon and
+        # we only ever append - we never rewrite the whole value.
+        $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+
+        # Split on ';' and compare entries case-insensitively so wildcard chars
+        # in the path do not break the match and sibling directories with a
+        # shared prefix do not trigger a false-positive.
+        $pathEntries = if ($userPath) { $userPath -split ';' | Where-Object { $_ -ne '' } } else { @() }
+        $alreadyPresent = $pathEntries | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') }
+        if (-not $alreadyPresent) {
+            $newUserPath = if ($userPath) { "$userPath;$installDir" } else { $installDir }
+            [Environment]::SetEnvironmentVariable("PATH", $newUserPath, "User")
+            Write-Success "Added $installDir to your PATH (takes effect in new shells)"
+        }
+
+        # Also update the current session's PATH so Test-Installation can find the binary.
+        $sessionEntries = $env:PATH -split ';' | Where-Object { $_ -ne '' }
+        $sessionPresent = $sessionEntries | Where-Object { $_.TrimEnd('\') -ieq $installDir.TrimEnd('\') }
+        if (-not $sessionPresent) {
+            $env:PATH = "$env:PATH;$installDir"
         }
     } finally {
         Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -285,17 +360,9 @@ function Install-ViaBinary {
 function Test-Installation {
     Write-Step "Verifying installation"
 
-    # Refresh PATH for current session
-    $env:PATH = [Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [Environment]::GetEnvironmentVariable("PATH", "User")
-
-    $cmd = Get-Command $BINARY_NAME -ErrorAction SilentlyContinue
-    if ($cmd) {
-        $versionOutput = & $BINARY_NAME version 2>&1
-        Write-Success "$BINARY_NAME is installed: $versionOutput"
-        return
-    }
-
-    # Check common locations
+    # Build the list of candidate absolute paths to check, most-specific first.
+    # We intentionally probe by absolute path rather than searching the current
+    # session PATH so the check is deterministic and immune to stale PATH state.
     $gopath = $null
     if (Get-Command "go" -ErrorAction SilentlyContinue) {
         $gopath = & go env GOPATH 2>$null
@@ -308,12 +375,24 @@ function Test-Installation {
     }
 
     foreach ($loc in $locations) {
-        if ($loc -and (Test-Path $loc)) {
-            $versionOutput = & $loc version 2>&1
-            Write-Success "Found $BINARY_NAME at $loc`: $versionOutput"
-            Write-Warn "Binary location is not in your PATH. Add it to use '$BINARY_NAME' directly."
-            return
+        if (-not ($loc -and (Test-Path $loc))) { continue }
+
+        # Use --version (fast, no system detection, no self-update) and suppress
+        # self-update explicitly via GENTLE_AI_NO_SELF_UPDATE so the check is a
+        # pure version read even if the binary is older.
+        $env:GENTLE_AI_NO_SELF_UPDATE = "1"
+        $versionOutput = & $loc --version 2>&1
+        Remove-Item Env:GENTLE_AI_NO_SELF_UPDATE -ErrorAction SilentlyContinue
+
+        Write-Success "$BINARY_NAME installed at $loc`: $versionOutput"
+
+        # Inform the user if the binary is not yet reachable by name.
+        $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+        $binaryDir = [System.IO.Path]::GetDirectoryName($loc)
+        if ($userPath -notlike "*$binaryDir*") {
+            Write-Warn "Binary location is not in your PATH. Open a new shell or add it manually."
         }
+        return
     }
 
     Write-Warn "Could not verify installation. You may need to restart your terminal."
@@ -324,11 +403,17 @@ function Test-Installation {
 # ============================================================================
 
 function Show-NextSteps {
+    param([string]$Channel = "stable")
+
     Write-Host ""
     Write-Host "Installation complete!" -ForegroundColor Green
     Write-Host ""
     Write-Host "Next steps:" -ForegroundColor White
-    Write-Host "  1. Run '$BINARY_NAME' to start the TUI installer" -ForegroundColor Cyan
+    if ($Channel -eq "beta") {
+        Write-Host ('  1. Run ''$env:GENTLE_AI_CHANNEL = "beta"; {0} install'' to keep using the beta channel' -f $BINARY_NAME) -ForegroundColor Cyan
+    } else {
+        Write-Host "  1. Run '$BINARY_NAME' to start the TUI installer" -ForegroundColor Cyan
+    }
     Write-Host "  2. Select your AI agent(s) and tools to configure" -ForegroundColor Cyan
     Write-Host "  3. Follow the interactive prompts" -ForegroundColor Cyan
     Write-Host ""
@@ -342,20 +427,35 @@ function Show-NextSteps {
 # ============================================================================
 
 function Main {
+    [CmdletBinding()]
+    param(
+        [ValidateSet("auto", "go", "binary")]
+        [string]$Method = "auto",
+
+        [ValidateSet("stable", "beta", "nightly")]
+        [string]$Channel = $(if ($env:GENTLE_AI_CHANNEL) { $env:GENTLE_AI_CHANNEL } else { "stable" }),
+
+        [string]$InstallDir = "",
+
+        [switch]$Insecure
+    )
+
     Show-Banner
 
     $arch = Get-Platform
     Test-Prerequisites
 
-    $installMethod = Get-InstallMethod -Forced $Method
+    if ($Channel -eq "nightly") { $Channel = "beta" }
+
+    $installMethod = Get-InstallMethod -Forced $Method -Channel $Channel
 
     switch ($installMethod) {
-        "go"     { Install-ViaGo }
+        "go"     { Install-ViaGo -Channel $Channel }
         "binary" { Install-ViaBinary -Arch $arch }
     }
 
     Test-Installation
-    Show-NextSteps
+    Show-NextSteps -Channel $Channel
 }
 
-Main
+Main @args

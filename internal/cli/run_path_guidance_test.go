@@ -27,8 +27,55 @@ func TestEngramPathGuidanceZsh(t *testing.T) {
 
 func TestEngramPathGuidanceDefault(t *testing.T) {
 	msg := engramPathGuidance("")
-	if want := "go/bin"; !strings.Contains(msg, want) {
+	want := filepath.Join("go", "bin")
+	if !strings.Contains(msg, want) {
 		t.Fatalf("engramPathGuidance(default) missing %q: %s", want, msg)
+	}
+}
+
+func TestOpenCodeExperimentalGuidance(t *testing.T) {
+	tests := []struct {
+		name  string
+		shell string
+		want  string
+	}{
+		{name: "fish", shell: "/usr/bin/fish", want: "set -Ux OPENCODE_EXPERIMENTAL true"},
+		{name: "zsh", shell: "/bin/zsh", want: "echo 'export OPENCODE_EXPERIMENTAL=true' >> ~/.zshrc && source ~/.zshrc"},
+		{name: "bash", shell: "/bin/bash", want: "echo 'export OPENCODE_EXPERIMENTAL=true' >> ~/.bashrc && source ~/.bashrc"},
+		{name: "fallback", shell: "", want: "OPENCODE_EXPERIMENTAL=true"},
+		{name: "powershell-fallback", shell: "powershell.exe", want: "SetEnvironmentVariable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := openCodeExperimentalGuidance(tt.shell)
+			if !strings.Contains(msg, tt.want) {
+				t.Fatalf("openCodeExperimentalGuidance(%q) missing %q: %s", tt.shell, tt.want, msg)
+			}
+		})
+	}
+}
+
+func TestWithOpenCodeExperimentalNoteGatedOnOpenCode(t *testing.T) {
+	tests := []struct {
+		name     string
+		agents   []model.AgentID
+		wantNote bool
+	}{
+		{name: "opencode selected", agents: []model.AgentID{model.AgentOpenCode}, wantNote: true},
+		{name: "opencode not selected", agents: []model.AgentID{model.AgentClaudeCode}, wantNote: false},
+		{name: "no agents", agents: nil, wantNote: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			report := verify.Report{Ready: true, FinalNote: "You're ready."}
+			resolved := planner.ResolvedPlan{Agents: tt.agents}
+
+			updated := withOpenCodeExperimentalNote(report, resolved)
+			hasNote := strings.Contains(updated.FinalNote, "OpenCode experimental features")
+			if hasNote != tt.wantNote {
+				t.Fatalf("withOpenCodeExperimentalNote note present = %v, want %v; got: %q", hasNote, tt.wantNote, updated.FinalNote)
+			}
+		})
 	}
 }
 
@@ -76,7 +123,7 @@ func TestWithGoInstallPathNoteAddsNoteWhenNotInPATH(t *testing.T) {
 	t.Setenv("GOBIN", "")
 	t.Setenv("GOPATH", "")
 	// Set PATH to something that does NOT contain ~/go/bin.
-	t.Setenv("PATH", "/usr/bin:/usr/local/bin")
+	t.Setenv("PATH", "/usr/bin"+string(os.PathListSeparator)+"/usr/local/bin")
 
 	report := verify.Report{Ready: true, FinalNote: "You're ready."}
 	resolved := planner.ResolvedPlan{
@@ -88,8 +135,9 @@ func TestWithGoInstallPathNoteAddsNoteWhenNotInPATH(t *testing.T) {
 	if !strings.Contains(updated.FinalNote, "go install") {
 		t.Fatalf("FinalNote should contain go install guidance, got: %q", updated.FinalNote)
 	}
-	if !strings.Contains(updated.FinalNote, "go/bin") {
-		t.Fatalf("FinalNote should reference go/bin dir, got: %q", updated.FinalNote)
+	want := filepath.Join("go", "bin")
+	if !strings.Contains(updated.FinalNote, want) {
+		t.Fatalf("FinalNote should reference %s dir, got: %q", want, updated.FinalNote)
 	}
 }
 

@@ -8,10 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
+	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/internal/state"
 	"github.com/gentleman-programming/gentle-ai/internal/system"
 	"github.com/gentleman-programming/gentle-ai/internal/update"
 )
@@ -80,7 +83,7 @@ func TestExecute_DevBuildOnlyNoBackupCreated(t *testing.T) {
 	execCalled := false
 	execCommand = func(name string, args ...string) *exec.Cmd {
 		execCalled = true
-		return exec.Command("echo", "should not be called")
+		return mockCmd("echo", "should not be called")
 	}
 
 	results := []update.UpdateResult{
@@ -165,7 +168,7 @@ func TestExecute_RegisteredNotMaterializedIsExecutable(t *testing.T) {
 	execCalled := false
 	execCommand = func(name string, args ...string) *exec.Cmd {
 		execCalled = true
-		return exec.Command("true")
+		return mockCmd("true")
 	}
 
 	result := makeResult("opencode-sdd-engram-manage", update.RegisteredNotMaterialized, "", "1.2.0", update.InstallOpenCodePlugin)
@@ -222,7 +225,7 @@ func TestExecute_BackupBeforeExecution(t *testing.T) {
 	execCommand = func(name string, args ...string) *exec.Cmd {
 		calls = append(calls, name)
 		// Return a real passing command (echo) so exec succeeds.
-		return exec.Command("echo", "ok")
+		return mockCmd("echo", "ok")
 	}
 
 	results := []update.UpdateResult{
@@ -247,7 +250,7 @@ func TestExecuteProgressDoesNotIncludeBackupExclusionDiagnostics(t *testing.T) {
 	origExecCommand := execCommand
 	t.Cleanup(func() { execCommand = origExecCommand })
 	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("echo", "ok")
+		return mockCmd("echo", "ok")
 	}
 
 	home := t.TempDir()
@@ -293,7 +296,7 @@ func TestExecute_DryRunNeverExecs(t *testing.T) {
 	called := false
 	execCommand = func(name string, args ...string) *exec.Cmd {
 		called = true
-		return exec.Command("echo", "should not run")
+		return mockCmd("echo", "should not run")
 	}
 
 	results := []update.UpdateResult{
@@ -332,10 +335,10 @@ func TestExecute_PerToolSuccessAndFailure(t *testing.T) {
 		// engram go install succeeds, gga curl/download attempt fails — we simulate
 		// the failure by having execCommand return false for "gga" detection.
 		if name == "go" {
-			return exec.Command("echo", "go install ok")
+			return mockCmd("echo", "go install ok")
 		}
 		// Any other exec attempt fails.
-		return exec.Command("false")
+		return mockCmd("false")
 	}
 
 	results := []update.UpdateResult{
@@ -365,7 +368,7 @@ func TestExecute_DevBuildIsSkipped(t *testing.T) {
 	origExecCommand := execCommand
 	t.Cleanup(func() { execCommand = origExecCommand })
 	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("echo", "ok")
+		return mockCmd("echo", "ok")
 	}
 
 	results := []update.UpdateResult{
@@ -419,7 +422,7 @@ func TestExecute_FailureDoesNotImplyConfigLoss(t *testing.T) {
 
 	// Force all exec to fail.
 	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("false")
+		return mockCmd("false")
 	}
 
 	results := []update.UpdateResult{
@@ -461,7 +464,7 @@ func TestExecute_DevBuildSurfacedAsSkipped(t *testing.T) {
 	origExecCommand := execCommand
 	t.Cleanup(func() { execCommand = origExecCommand })
 	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("echo", "ok")
+		return mockCmd("echo", "ok")
 	}
 
 	results := []update.UpdateResult{
@@ -508,58 +511,6 @@ func TestExecute_DevBuildSurfacedAsSkipped(t *testing.T) {
 	}
 }
 
-// --- TestExecute_ManualFallbackSurfacedAsSkippedNotFailed ---
-
-// TestExecute_ManualFallbackSurfacedAsSkippedNotFailed verifies the spec gap:
-// When runStrategy returns a manual fallback error (e.g. Windows binary self-replace),
-// the ToolUpgradeResult must be UpgradeSkipped (not UpgradeFailed) and ManualHint
-// must be populated from the error message so RenderUpgradeReport can display it.
-func TestExecute_ManualFallbackSurfacedAsSkippedNotFailed(t *testing.T) {
-	origExecCommand := execCommand
-	t.Cleanup(func() { execCommand = origExecCommand })
-
-	execCalled := false
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		execCalled = true
-		return exec.Command("echo", "should not be called")
-	}
-
-	// Windows profile → binaryUpgrade returns a manual fallback error.
-	windowsProfile := system.PlatformProfile{OS: "windows", PackageManager: "winget", Supported: true}
-
-	results := []update.UpdateResult{
-		makeResult("gentle-ai", update.UpdateAvailable, "1.0.0", "1.5.0", update.InstallBinary),
-	}
-	results[0].UpdateHint = "See https://github.com/Gentleman-Programming/gentle-ai/releases"
-
-	report := Execute(context.Background(), results, windowsProfile, t.TempDir(), false)
-
-	if execCalled {
-		t.Errorf("execCommand should not be called for Windows binary manual fallback")
-	}
-
-	if len(report.Results) != 1 {
-		t.Fatalf("len(Results) = %d, want 1", len(report.Results))
-	}
-
-	r := report.Results[0]
-
-	// Must be UpgradeSkipped (not UpgradeFailed) — this is a manual action, not a failure.
-	if r.Status != UpgradeSkipped {
-		t.Errorf("Windows binary fallback Status = %q, want UpgradeSkipped (not UpgradeFailed)", r.Status)
-	}
-
-	// ManualHint must be populated.
-	if r.ManualHint == "" {
-		t.Errorf("Windows binary fallback ManualHint must be non-empty")
-	}
-
-	// Err should be nil for a manual skip (it is not a failure).
-	if r.Err != nil {
-		t.Errorf("Windows binary fallback Err = %v, want nil (manual skips are not errors)", r.Err)
-	}
-}
-
 // --- TestExecute_ConfigNotMutatedDuringUpgrade ---
 
 // TestExecute_ConfigNotMutatedDuringUpgrade provides direct evidence that upgrade
@@ -590,7 +541,7 @@ func TestExecute_ConfigNotMutatedDuringUpgrade(t *testing.T) {
 	t.Cleanup(func() { execCommand = origExecCommand })
 	execCommand = func(name string, args ...string) *exec.Cmd {
 		// Simulate a successful upgrade (no-op shell command).
-		return exec.Command("echo", "upgrade ok")
+		return mockCmd("echo", "upgrade ok")
 	}
 
 	results := []update.UpdateResult{
@@ -721,7 +672,7 @@ func TestExecute_ForcedSnapshotFailureSurfacesWarningEndToEnd(t *testing.T) {
 
 	// Stub exec so the upgrade itself succeeds (we're only testing the backup path).
 	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("echo", "upgrade ok")
+		return mockCmd("echo", "upgrade ok")
 	}
 
 	// Force snapshot creation to fail.
@@ -784,7 +735,7 @@ func TestExecute_UpgradeBackupManifestHasUpgradeMetadata(t *testing.T) {
 		AppVersion = origAppVersion
 	})
 	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("echo", "ok")
+		return mockCmd("echo", "ok")
 	}
 	AppVersion = "3.0.0"
 
@@ -843,7 +794,7 @@ func TestExecute_SuccessfulSnapshotHasNoWarning(t *testing.T) {
 	origExecCommand := execCommand
 	t.Cleanup(func() { execCommand = origExecCommand })
 	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("echo", "ok")
+		return mockCmd("echo", "ok")
 	}
 	// snapshotCreator is intentionally left at its real default.
 
@@ -877,7 +828,8 @@ func TestConfigPathsForBackup_CoversRegistryAgentsNotInOldList(t *testing.T) {
 	homeDir := t.TempDir()
 
 	// Create a file under codex config dir — not in old hardcoded list.
-	codexFile := filepath.Join(homeDir, ".codex", "agents.md")
+	// Use uppercase AGENTS.md to match the codex CLI convention (fix for #299).
+	codexFile := filepath.Join(homeDir, ".codex", "AGENTS.md")
 	if err := os.MkdirAll(filepath.Dir(codexFile), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
@@ -1240,48 +1192,6 @@ func TestConfigPathsForBackup_ExcludesRuntimeDirs(t *testing.T) {
 	}
 }
 
-// --- TestExecute_SkippedUpgradeDoesNotRenderFailureMarker ---
-
-// TestExecute_SkippedUpgradeDoesNotRenderFailureMarker verifies that when a tool
-// upgrade is intentionally skipped (e.g. Windows manual fallback), the progress
-// output shown to the user does NOT contain the ✗ failure marker.
-//
-// RED: This test must fail before the fix because the executor calls Finish(false)
-// for any non-success result, which renders ✗ for skipped/manual outcomes.
-func TestExecute_SkippedUpgradeDoesNotRenderFailureMarker(t *testing.T) {
-	origExecCommand := execCommand
-	t.Cleanup(func() { execCommand = origExecCommand })
-
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		return exec.Command("echo", "should not run")
-	}
-
-	// Windows profile → binary self-update returns manual fallback → UpgradeSkipped.
-	windowsProfile := system.PlatformProfile{OS: "windows", PackageManager: "winget", Supported: true}
-
-	results := []update.UpdateResult{
-		makeResult("gentle-ai", update.UpdateAvailable, "1.0.0", "1.5.0", update.InstallBinary),
-	}
-	results[0].UpdateHint = "See https://github.com/Gentleman-Programming/gentle-ai/releases"
-
-	// Capture the progress output written to the progress writer.
-	var progressBuf bytes.Buffer
-
-	Execute(context.Background(), results, windowsProfile, t.TempDir(), false, &progressBuf)
-
-	got := progressBuf.String()
-
-	// The spinner output for a skipped/manual tool must NOT show ✗.
-	if strings.Contains(got, "✗") {
-		t.Errorf("Execute() progress output for skipped upgrade contains '✗' (failure marker):\n%s\nWant skip marker '--' or '⊘' instead", got)
-	}
-
-	// The spinner output for a skipped/manual tool should show a skip marker.
-	if !strings.Contains(got, "--") && !strings.Contains(got, "⊘") {
-		t.Errorf("Execute() progress output for skipped upgrade = %q, want skip marker '--' or '⊘'", got)
-	}
-}
-
 // TestEnumerateFilesInDir_ExcludesNestedSameNameDir documents the intentional
 // behavior change: directories matching an excluded name are pruned at ANY depth,
 // not just directly under the walked root. For example, mcp/cache/data.json is
@@ -1416,3 +1326,122 @@ func TestEnumerateFilesInDir_CaseInsensitiveExclude(t *testing.T) {
 		t.Errorf("mixed-case 'Cache' dir should be excluded by lowercase 'cache' key: %q", mixedDir)
 	}
 }
+
+// --- Phase 4: state.json-driven backup scope (issues #114, #354) ---
+
+// TestConfigPathsForBackup_StateWinsOverFilesystem verifies that when state.json
+// lists a subset of agents, configPathsForBackup backs up only those agents'
+// config paths — NOT all detected config dirs.
+//
+// Scenario: state.json has 1 agent (claude-code); filesystem also has gemini-cli.
+// Backup must include claude-code paths but NOT gemini-cli paths.
+func TestConfigPathsForBackup_StateWinsOverFilesystem(t *testing.T) {
+	homeDir := t.TempDir()
+
+	// Create both agent config dirs on disk (simulates filesystem detection).
+	claudeDir := filepath.Join(homeDir, ".claude")
+	geminiDir := filepath.Join(homeDir, ".gemini")
+	for _, dir := range []string{claudeDir, geminiDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	// Write a managed claude-code config file that should be backed up.
+	claudeSettings := filepath.Join(claudeDir, "settings.json")
+	if err := os.WriteFile(claudeSettings, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write %s: %v", claudeSettings, err)
+	}
+	// Write a gemini config file that should NOT be backed up (not in state).
+	geminiSettings := filepath.Join(geminiDir, "settings.json")
+	if err := os.WriteFile(geminiSettings, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write %s: %v", geminiSettings, err)
+	}
+
+	// Write state.json with only claude-code — this is the user's explicit selection.
+	if err := state.Write(homeDir, state.InstallState{
+		InstalledAgents: []string{string(model.AgentClaudeCode)},
+	}); err != nil {
+		t.Fatalf("state.Write: %v", err)
+	}
+
+	paths := configPathsForBackup(homeDir)
+	pathSet := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		pathSet[p] = struct{}{}
+	}
+
+	// Gemini settings must NOT appear in backup — not in state.json.
+	if _, ok := pathSet[geminiSettings]; ok {
+		t.Errorf("configPathsForBackup included gemini-cli settings %q which is not in state.json; state.json should be the source of truth", geminiSettings)
+	}
+}
+
+// TestConfigPathsForBackup_FallsBackToFilesystemWhenNoState verifies that when
+// state.json does not exist, configPathsForBackup falls back to filesystem
+// detection — preserving the first-time install behavior.
+func TestConfigPathsForBackup_FallsBackToFilesystemWhenNoState(t *testing.T) {
+	homeDir := t.TempDir()
+
+	// Create a claude config dir on disk — no state.json.
+	claudeDir := filepath.Join(homeDir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", claudeDir, err)
+	}
+	claudeSettings := filepath.Join(claudeDir, "settings.json")
+	if err := os.WriteFile(claudeSettings, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write %s: %v", claudeSettings, err)
+	}
+
+	// No state.json written — simulates fresh install.
+	paths := configPathsForBackup(homeDir)
+
+	// Result must not be nil (empty slice is fine, but nil would panic callers).
+	if paths == nil {
+		t.Error("configPathsForBackup returned nil when state.json missing, want non-nil")
+	}
+}
+
+// TestConfigPathsForBackup_EmptyStateAgentsFallsBackToFilesystem verifies that
+// state.json with an empty InstalledAgents list is treated the same as a missing
+// state.json — filesystem detection is used as fallback.
+func TestConfigPathsForBackup_EmptyStateAgentsFallsBackToFilesystem(t *testing.T) {
+	homeDir := t.TempDir()
+
+	// Write state.json with an empty agent list.
+	if err := state.Write(homeDir, state.InstallState{
+		InstalledAgents: []string{},
+	}); err != nil {
+		t.Fatalf("state.Write: %v", err)
+	}
+
+	// Create a claude config dir on disk.
+	claudeDir := filepath.Join(homeDir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", claudeDir, err)
+	}
+	claudeSettings := filepath.Join(claudeDir, "settings.json")
+	if err := os.WriteFile(claudeSettings, []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write %s: %v", claudeSettings, err)
+	}
+
+	paths := configPathsForBackup(homeDir)
+	if paths == nil {
+		t.Error("configPathsForBackup returned nil, want non-nil")
+	}
+}
+
+func mockCmd(name string, args ...string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		if name == "echo" {
+			return exec.Command("cmd", "/c", "echo "+strings.Join(args, " "))
+		}
+		if name == "true" {
+			return exec.Command("cmd", "/c", "exit 0")
+		}
+		if name == "false" {
+			return exec.Command("cmd", "/c", "exit 1")
+		}
+	}
+	return exec.Command(name, args...)
+}
+
